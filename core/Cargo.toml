@@ -22,4 +22,8 @@ base64 = "0.22"
 flate2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
+idna = "1.0"
+md-5 = "0.10"
+pathdiff = "0.2"
 

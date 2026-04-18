@@ -31,6 +31,9 @@ pub mod module_loader;
 mod process;
 mod runtime_policy;
 
+#[cfg(test)]
+mod compat_contract_tests;
+
 pub use esm_loader::{clear_module_caches, eval_esm_entry};
 
 struct HttpListenEntry {
@@ -76,7 +79,46 @@ impl Drop for RequireBaseDirGuard {
     }
 }
 
+/// Keep `package.json` `development` / `production` conditions aligned with `process.env.NODE_ENV`.
+pub(crate) unsafe fn refresh_package_exports_node_env(ctx: *mut qjs::JSContext) {
+    let global = qjs::JS_GetGlobalObject(ctx);
+    let proc_val = qjs::JS_GetPropertyStr(ctx, global, CString::new("process").unwrap().as_ptr());
+    js_free_value(ctx, global);
+    if qjs::JS_IsUndefined(proc_val) {
+        js_free_value(ctx, proc_val);
+        return;
+    }
+    let env_val = qjs::JS_GetPropertyStr(ctx, proc_val, CString::new("env").unwrap().as_ptr());
+    js_free_value(ctx, proc_val);
+    let ne_val = qjs::JS_GetPropertyStr(ctx, env_val, CString::new("NODE_ENV").unwrap().as_ptr());
+    js_free_value(ctx, env_val);
+    let s = if qjs::JS_IsUndefined(ne_val) || qjs::JS_IsNull(ne_val) {
+        js_free_value(ctx, ne_val);
+        "production".to_string()
+    } else {
+        let out = js_string_to_owned(ctx, ne_val);
+        js_free_value(ctx, ne_val);
+        if out.is_empty() {
+            "production".to_string()
+        } else {
+            out
+        }
+    };
+    module_loader::set_package_exports_node_env_from_process(s);
+}
+
 static NEXT_HTTP_LISTEN_ID: AtomicU64 = AtomicU64::new(1);
+
+static HTTP_BLOCKING_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+fn http_blocking_client() -> &'static reqwest::blocking::Client {
+    HTTP_BLOCKING_CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .expect("reqwest blocking client")
+    })
+}
 static NEXT_TIMER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HTTP_BODY_ACCUM_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_DGRAM_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
@@ -331,6 +373,7 @@ pub unsafe fn install_runtime(
         CString::new("process").unwrap().as_ptr(),
         process,
     );
+    refresh_package_exports_node_env(ctx);
 
     module_loader::install_require(ctx, global, entry_filename, &base_dir)?;
 
@@ -1503,6 +1546,86 @@ unsafe extern "C" fn js_write_file_sync(
         Err(e) => qjs::JS_ThrowTypeError(
             ctx,
             CString::new(format!("writeFileSync failed: {e}"))
+                .unwrap_or_default()
+                .as_ptr(),
+        ),
+    }
+}
+
+unsafe extern "C" fn js_fs_copy_file_sync(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("copyFileSync(src, dest) requires two paths")
+                .unwrap()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let src = js_string_to_owned(ctx, args[0]);
+    let dest = js_string_to_owned(ctx, args[1]);
+    match std::fs::copy(&src, &dest) {
+        Ok(n) => qjs::JS_NewFloat64(ctx, n as f64),
+        Err(e) => qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new(format!("copyFileSync failed: {e}"))
+                .unwrap_or_default()
+                .as_ptr(),
+        ),
+    }
+}
+
+unsafe extern "C" fn js_fs_rm_sync(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("rmSync(path) requires path").unwrap().as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let path = js_string_to_owned(ctx, args[0]);
+    let mut recursive = false;
+    let mut force = false;
+    if argc >= 2 && qjs::JS_IsObject(args[1]) {
+        let rec_k = CString::new("recursive").unwrap();
+        let rec_v = qjs::JS_GetPropertyStr(ctx, args[1], rec_k.as_ptr());
+        if qjs::JS_IsBool(rec_v) {
+            recursive = qjs::JS_ToBool(ctx, rec_v) != 0;
+        }
+        js_free_value(ctx, rec_v);
+        let force_k = CString::new("force").unwrap();
+        let force_v = qjs::JS_GetPropertyStr(ctx, args[1], force_k.as_ptr());
+        if qjs::JS_IsBool(force_v) {
+            force = qjs::JS_ToBool(ctx, force_v) != 0;
+        }
+        js_free_value(ctx, force_v);
+    }
+    let p = Path::new(&path);
+    let r = if p.is_dir() {
+        if recursive {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_dir(&path)
+        }
+    } else {
+        std::fs::remove_file(&path)
+    };
+    match r {
+        Ok(()) => js_undefined(),
+        Err(e) if force && e.kind() == ErrorKind::NotFound => js_undefined(),
+        Err(e) => qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new(format!("rmSync failed: {e}"))
                 .unwrap_or_default()
                 .as_ptr(),
         ),
@@ -4940,9 +5063,19 @@ unsafe extern "C" fn js_punycode_to_ascii(
     argc: c_int,
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
-    match punycode_baseline_input(ctx, argc, argv, "toASCII", false) {
-        Ok(s) => qjs_compat::new_string_from_str(ctx, &s),
-        Err(e) => e,
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("punycode.toASCII requires a string")
+                .unwrap_or_default()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let s = js_string_to_owned(ctx, args[0]);
+    match idna::domain_to_ascii(&s) {
+        Ok(out) => qjs_compat::new_string_from_str(ctx, &out),
+        Err(e) => crate::ffi::throw_type_error(ctx, &format!("punycode.toASCII: {e}")),
     }
 }
 
@@ -4952,10 +5085,21 @@ unsafe extern "C" fn js_punycode_to_unicode(
     argc: c_int,
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
-    match punycode_baseline_input(ctx, argc, argv, "toUnicode", true) {
-        Ok(s) => qjs_compat::new_string_from_str(ctx, &s),
-        Err(e) => e,
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("punycode.toUnicode requires a string")
+                .unwrap_or_default()
+                .as_ptr(),
+        );
     }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let s = js_string_to_owned(ctx, args[0]);
+    let (out, res) = idna::domain_to_unicode(&s);
+    if let Err(e) = res {
+        return crate::ffi::throw_type_error(ctx, &format!("punycode.toUnicode: {e:?}"));
+    }
+    qjs_compat::new_string_from_str(ctx, &out)
 }
 
 unsafe extern "C" fn js_process_chdir(
@@ -5887,6 +6031,152 @@ unsafe extern "C" fn js_zlib_gunzip_sync(
     unsafe { crate::ffi::arraybuffer_from_arc(ctx, Arc::from(out.into_boxed_slice())) }
 }
 
+unsafe extern "C" fn js_zlib_deflate_sync(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return crate::ffi::throw_type_error(ctx, "deflateSync(data) requires data");
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let input = buffer::buffer_bytes_from_value(ctx, args[0]);
+    let mut enc = flate2::read::DeflateEncoder::new(
+        std::io::Cursor::new(input),
+        flate2::Compression::default(),
+    );
+    let mut out = Vec::new();
+    if let Err(e) = enc.read_to_end(&mut out) {
+        return crate::ffi::throw_type_error(ctx, &format!("deflateSync: {e}"));
+    }
+    unsafe { crate::ffi::arraybuffer_from_arc(ctx, Arc::from(out.into_boxed_slice())) }
+}
+
+unsafe extern "C" fn js_zlib_inflate_sync(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return crate::ffi::throw_type_error(ctx, "inflateSync(data) requires data");
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let input = buffer::buffer_bytes_from_value(ctx, args[0]);
+    let mut dec = flate2::read::DeflateDecoder::new(std::io::Cursor::new(input));
+    let mut out = Vec::new();
+    if let Err(e) = dec.read_to_end(&mut out) {
+        return crate::ffi::throw_type_error(ctx, &format!("inflateSync: {e}"));
+    }
+    unsafe { crate::ffi::arraybuffer_from_arc(ctx, Arc::from(out.into_boxed_slice())) }
+}
+
+unsafe fn build_http_client_response_object(
+    ctx: *mut qjs::JSContext,
+    status: u16,
+    status_text: &str,
+    headers: &std::collections::HashMap<String, String>,
+    body: Vec<u8>,
+) -> qjs::JSValue {
+    let res = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("statusCode").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, status as i64),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("statusMessage").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, status_text),
+    );
+    let hdr = qjs::JS_NewObject(ctx);
+    for (k, v) in headers {
+        let ck = CString::new(k.as_str()).unwrap_or_default();
+        qjs::JS_SetPropertyStr(
+            ctx,
+            hdr,
+            ck.as_ptr(),
+            qjs_compat::new_string_from_str(ctx, v),
+        );
+    }
+    qjs::JS_SetPropertyStr(ctx, res, CString::new("headers").unwrap().as_ptr(), hdr);
+    let body_val =
+        unsafe { crate::ffi::arraybuffer_from_arc(ctx, Arc::from(body.into_boxed_slice())) };
+    qjs::JS_SetPropertyStr(ctx, res, CString::new("body").unwrap().as_ptr(), body_val);
+    res
+}
+
+unsafe extern "C" fn js_http_client_get(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("http.get(url, callback) requires url and callback")
+                .unwrap_or_default()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let url = js_string_to_owned(ctx, args[0]);
+    if qjs::JS_IsFunction(ctx, args[1]) == 0 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("http.get: callback must be a function")
+                .unwrap_or_default()
+                .as_ptr(),
+        );
+    }
+    let cb = args[1];
+    let client = http_blocking_client();
+    let resp = match client.get(&url).send() {
+        Ok(r) => r,
+        Err(e) => {
+            return crate::ffi::throw_type_error(ctx, &format!("http.get: request failed: {e}"));
+        }
+    };
+    let status = resp.status().as_u16();
+    let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+    let mut hdr_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (name, value) in resp.headers().iter() {
+        let k = name.as_str().to_ascii_lowercase();
+        let v = value.to_str().unwrap_or("");
+        hdr_map
+            .entry(k)
+            .and_modify(|e| {
+                e.push_str(", ");
+                e.push_str(v);
+            })
+            .or_insert_with(|| v.to_string());
+    }
+    let body = match resp.bytes() {
+        Ok(b) => b.to_vec(),
+        Err(e) => {
+            return crate::ffi::throw_type_error(ctx, &format!("http.get: read body: {e}"));
+        }
+    };
+    let res_obj = build_http_client_response_object(ctx, status, &status_text, &hdr_map, body);
+    let mut arg = [res_obj];
+    let out = qjs::JS_Call(ctx, cb, js_undefined(), 1, arg.as_mut_ptr());
+    js_free_value(ctx, out);
+    js_undefined()
+}
+
+unsafe extern "C" fn js_http_client_request(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    js_http_client_get(ctx, this, argc, argv)
+}
+
 unsafe extern "C" fn js_kawkab_fast_sum(
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
@@ -6672,6 +6962,8 @@ unsafe extern "C" fn js_require(
         let obj = qjs::JS_NewObject(ctx);
         let _ = install_obj_fn(ctx, obj, "readFileSync", Some(js_read_file_sync), 1);
         let _ = install_obj_fn(ctx, obj, "writeFileSync", Some(js_write_file_sync), 2);
+        let _ = install_obj_fn(ctx, obj, "copyFileSync", Some(js_fs_copy_file_sync), 2);
+        let _ = install_obj_fn(ctx, obj, "rmSync", Some(js_fs_rm_sync), 2);
         let _ = install_obj_fn(ctx, obj, "existsSync", Some(js_fs_exists_sync), 1);
         let _ = install_obj_fn(ctx, obj, "mkdirSync", Some(js_fs_mkdir_sync), 2);
         let _ = install_obj_fn(ctx, obj, "readdirSync", Some(js_fs_readdir_sync), 1);
@@ -6707,6 +6999,8 @@ unsafe extern "C" fn js_require(
         let _ = install_obj_fn(ctx, obj, "extname", Some(js_path_extname), 1);
         let _ = install_obj_fn(ctx, obj, "resolve", Some(js_path_resolve), 4);
         let _ = install_obj_fn(ctx, obj, "normalize", Some(js_path_normalize), 1);
+        let _ = install_obj_fn(ctx, obj, "relative", Some(js_path_relative), 2);
+        let _ = install_obj_fn(ctx, obj, "parse", Some(js_path_parse), 1);
         #[cfg(windows)]
         {
             let _ = set_str_prop(ctx, obj, "sep", "\\");
@@ -6778,7 +7072,7 @@ unsafe extern "C" fn js_require(
         }
         return obj;
     }
-    if request == "net" || request == "http" || request == "https" {
+    if request == "net" {
         let obj = qjs::JS_NewObject(ctx);
         let create = qjs::JS_NewCFunction2(
             ctx,
@@ -6794,6 +7088,26 @@ unsafe extern "C" fn js_require(
             CString::new("createServer").unwrap().as_ptr(),
             create,
         );
+        return obj;
+    }
+    if request == "http" || request == "https" {
+        let obj = qjs::JS_NewObject(ctx);
+        let create = qjs::JS_NewCFunction2(
+            ctx,
+            Some(js_net_http_create_server),
+            CString::new("createServer").unwrap().as_ptr(),
+            1,
+            qjs::JSCFunctionEnum_JS_CFUNC_generic,
+            0,
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            obj,
+            CString::new("createServer").unwrap().as_ptr(),
+            create,
+        );
+        let _ = install_obj_fn(ctx, obj, "get", Some(js_http_client_get), 2);
+        let _ = install_obj_fn(ctx, obj, "request", Some(js_http_client_request), 2);
         return obj;
     }
     if request == "child_process" {
@@ -6900,6 +7214,8 @@ unsafe extern "C" fn js_require(
         let obj = qjs::JS_NewObject(ctx);
         let _ = install_obj_fn(ctx, obj, "gzipSync", Some(js_zlib_gzip_sync), 1);
         let _ = install_obj_fn(ctx, obj, "gunzipSync", Some(js_zlib_gunzip_sync), 1);
+        let _ = install_obj_fn(ctx, obj, "deflateSync", Some(js_zlib_deflate_sync), 1);
+        let _ = install_obj_fn(ctx, obj, "inflateSync", Some(js_zlib_inflate_sync), 1);
         return obj;
     }
     if request == "tls" {
@@ -7010,6 +7326,7 @@ unsafe extern "C" fn js_require(
         let _ = install_obj_fn(ctx, obj, "createRequire", Some(js_module_create_require), 1);
         return obj;
     }
+    refresh_package_exports_node_env(ctx);
     let base = REQUIRE_BASE_DIR.with(|v| v.borrow().clone());
     let resolved = resolve_module_path(&base, &request);
 
@@ -7456,6 +7773,101 @@ unsafe extern "C" fn js_fs_rmdir_sync(
                 .as_ptr(),
         ),
     }
+}
+
+unsafe extern "C" fn js_path_relative(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("path.relative(from, to) requires two paths")
+                .unwrap()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let from = js_string_to_owned(ctx, args[0]);
+    let to = js_string_to_owned(ctx, args[1]);
+    let rel = pathdiff::diff_paths(Path::new(&to), Path::new(&from))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| to.clone());
+    qjs_compat::new_string_from_str(ctx, &rel)
+}
+
+unsafe extern "C" fn js_path_parse(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("path.parse(path) requires path")
+                .unwrap()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let pstr = js_string_to_owned(ctx, args[0]);
+    let path = Path::new(&pstr);
+    let dir = path
+        .parent()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let root = if pstr.starts_with('/') {
+        "/".to_string()
+    } else {
+        String::new()
+    };
+    let base = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let obj = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("root").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &root),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("dir").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &dir),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("base").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &base),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("ext").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &ext),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("name").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &stem),
+    );
+    obj
 }
 
 unsafe extern "C" fn js_path_join(

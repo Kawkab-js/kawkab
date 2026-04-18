@@ -1,6 +1,19 @@
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
+
+thread_local! {
+    /// `process.env.NODE_ENV` as seen by the embedder (kept in sync from JS `process.env`).
+    static PACKAGE_EXPORTS_NODE_ENV: RefCell<String> = RefCell::new(
+        std::env::var("NODE_ENV").unwrap_or_else(|_| "production".into()),
+    );
+}
+
+/// Called when `process` exists; keeps `exports` / `imports` condition matching aligned with JS.
+pub(crate) fn set_package_exports_node_env_from_process(node_env: String) {
+    PACKAGE_EXPORTS_NODE_ENV.with(|c| *c.borrow_mut() = node_env);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceType {
@@ -53,7 +66,7 @@ pub fn split_package_specifier(specifier: &str) -> Option<(String, Option<String
 }
 
 fn condition_list(kind: ModuleResolutionKind) -> Vec<String> {
-    let ne = std::env::var("NODE_ENV").unwrap_or_else(|_| "production".into());
+    let ne = PACKAGE_EXPORTS_NODE_ENV.with(|c| c.borrow().clone());
     let ne_key = if ne == "development" {
         "development"
     } else {
@@ -520,11 +533,7 @@ pub fn resolve_module_path_with_kind(
         if let Ok(v) = serde_json::from_str::<Value>(&raw) {
             if let Some(main_rel) = preferred_package_entry_from_value(&v, kind) {
                 let rel_trim = main_rel.trim_start_matches("./");
-                return resolve_module_path_with_kind(
-                    &req.to_string_lossy(),
-                    rel_trim,
-                    kind,
-                );
+                return resolve_module_path_with_kind(&req.to_string_lossy(), rel_trim, kind);
             }
         }
     }
@@ -576,12 +585,7 @@ pub fn resolve_npm_package_with_kind(
     if current.is_file() {
         current = current.parent()?.to_path_buf();
     }
-    resolve_bare_specifier(
-        &current.to_string_lossy(),
-        name,
-        kind,
-    )
-    .map(PathBuf::from)
+    resolve_bare_specifier(&current.to_string_lossy(), name, kind).map(PathBuf::from)
 }
 
 #[allow(dead_code)] // Kept for tooling / future call sites that read `main` from raw JSON.
@@ -636,7 +640,10 @@ mod tests {
             split_package_specifier("lodash/get"),
             Some(("lodash".into(), Some("get".into())))
         );
-        assert_eq!(split_package_specifier("axios"), Some(("axios".into(), None)));
+        assert_eq!(
+            split_package_specifier("axios"),
+            Some(("axios".into(), None))
+        );
     }
 
     #[test]
@@ -666,7 +673,10 @@ mod tests {
         );
         write_file(&tmp.join("node_modules/left-pad/c.js"), "module.exports=1");
         write_file(&tmp.join("node_modules/left-pad/e.mjs"), "export default 1");
-        write_file(&tmp.join("node_modules/left-pad/lite.js"), "module.exports=2");
+        write_file(
+            &tmp.join("node_modules/left-pad/lite.js"),
+            "module.exports=2",
+        );
         let base = tmp.to_string_lossy();
         let cjs = resolve_module_path(&base, "left-pad/lite");
         assert!(cjs.ends_with("lite.js"), "{}", cjs);

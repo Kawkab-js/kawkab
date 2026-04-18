@@ -1,3 +1,5 @@
+use blake3::Hasher;
+use md5::{Digest, Md5};
 use ring::{
     digest, hmac,
     rand::{SecureRandom, SystemRandom},
@@ -9,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub enum CryptoContext {
     Hash(digest::Context),
     Hmac(hmac::Context),
+    Md5(Md5),
+    Blake3(Hasher),
 }
 
 thread_local! {
@@ -26,17 +30,20 @@ pub fn random_bytes(size: usize) -> Result<Vec<u8>, String> {
 }
 
 pub fn create_hash(algorithm: &str) -> Result<u64, String> {
-    let alg = match algorithm.to_lowercase().as_str() {
-        "sha256" => &digest::SHA256,
-        "sha512" => &digest::SHA512,
-        "sha384" => &digest::SHA384,
-        "sha1" => &digest::SHA1_FOR_LEGACY_USE_ONLY,
-        _ => return Err(format!("Unsupported hash algorithm: {}", algorithm)),
-    };
-    let context = digest::Context::new(alg);
     let id = NEXT_CONTEXT_ID.fetch_add(1, Ordering::SeqCst);
+    let ctx = match algorithm.to_lowercase().as_str() {
+        "sha256" => CryptoContext::Hash(digest::Context::new(&digest::SHA256)),
+        "sha512" => CryptoContext::Hash(digest::Context::new(&digest::SHA512)),
+        "sha384" => CryptoContext::Hash(digest::Context::new(&digest::SHA384)),
+        "sha1" => CryptoContext::Hash(digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY)),
+        "md5" => CryptoContext::Md5(Md5::new()),
+        "blake3" => CryptoContext::Blake3(Hasher::new()),
+        _ => {
+            return Err(format!("Unsupported hash algorithm: {}", algorithm));
+        }
+    };
     CRYPTO_REGISTRY.with(|r| {
-        r.borrow_mut().insert(id, CryptoContext::Hash(context));
+        r.borrow_mut().insert(id, ctx);
     });
     Ok(id)
 }
@@ -64,6 +71,12 @@ pub fn update(id: u64, data: &[u8]) -> Result<(), String> {
             match ctx {
                 CryptoContext::Hash(c) => c.update(data),
                 CryptoContext::Hmac(c) => c.update(data),
+                CryptoContext::Md5(h) => {
+                    h.update(data);
+                }
+                CryptoContext::Blake3(h) => {
+                    h.update(data);
+                }
             }
             Ok(())
         } else {
@@ -79,6 +92,8 @@ pub fn digest(id: u64) -> Result<Vec<u8>, String> {
             match ctx {
                 CryptoContext::Hash(c) => Ok(c.finish().as_ref().to_vec()),
                 CryptoContext::Hmac(c) => Ok(c.sign().as_ref().to_vec()),
+                CryptoContext::Md5(h) => Ok(h.finalize().to_vec()),
+                CryptoContext::Blake3(h) => Ok(h.finalize().as_bytes().to_vec()),
             }
         } else {
             Err("Crypto context not found".to_string())

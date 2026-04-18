@@ -1,6 +1,7 @@
 use crate::error::JsError;
 use crate::qjs_compat;
 use quickjs_sys as qjs;
+use std::ffi::CString;
 use std::ptr;
 
 #[derive(Debug, Clone)]
@@ -61,15 +62,19 @@ impl Isolate {
     }
 
     pub fn eval(&mut self, src: &[u8], filename: &str) -> Result<qjs::JSValue, JsError> {
-        let c_filename = std::ffi::CString::new(filename)
+        let c_src = CString::new(src)
+            .map_err(|_| JsError::Runtime("Invalid script (embedded NUL byte)".to_string()))?;
+        let c_filename = CString::new(filename)
             .map_err(|_| JsError::Runtime("Invalid filename".to_string()))?;
         let flags = qjs::JS_EVAL_TYPE_GLOBAL as i32;
 
         unsafe {
+            // Length is byte length **excluding** the trailing NUL from `CString` (QuickJS reads
+            // exactly `len` bytes from `input`).
             let val = qjs_compat::eval(
                 self.ctx,
-                src.as_ptr() as *const i8,
-                src.len(),
+                c_src.as_ptr(),
+                c_src.as_bytes().len().saturating_sub(1),
                 c_filename.as_ptr(),
                 flags,
             );

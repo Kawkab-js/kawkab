@@ -32,6 +32,7 @@ unsafe extern "C" fn normalize_module(
     module_name: *const c_char,
     _opaque: *mut c_void,
 ) -> *mut c_char {
+    super::refresh_package_exports_node_env(ctx);
     let name = CStr::from_ptr(module_name).to_string_lossy().into_owned();
 
     let resolved = if name.starts_with('/') {
@@ -76,6 +77,7 @@ unsafe extern "C" fn load_module(
     module_name: *const c_char,
     _opaque: *mut c_void,
 ) -> *mut qjs::JSModuleDef {
+    super::refresh_package_exports_node_env(ctx);
     let path = CStr::from_ptr(module_name).to_string_lossy().into_owned();
 
     if path.ends_with(".json") {
@@ -403,6 +405,7 @@ unsafe extern "C" fn js_import_meta_resolve(
     _magic: i32,
     data: *mut qjs::JSValue,
 ) -> qjs::JSValue {
+    super::refresh_package_exports_node_env(ctx);
     if argc < 1 {
         return qjs::JS_ThrowTypeError(
             ctx,
