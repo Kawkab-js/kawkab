@@ -147,14 +147,21 @@ pub fn execute_command(cwd: &Path, command: PmCommand) -> anyhow::Result<()> {
                     let status = if check.ok { "ok" } else { "fail" };
                     println!("  - {}: {} ({})", check.name, status, check.message);
                 }
-                println!("  summary: {}/{} checks passed", report.passed, report.total);
+                println!(
+                    "  summary: {}/{} checks passed",
+                    report.passed, report.total
+                );
             }
         }
     }
     Ok(())
 }
 
-fn install_workspace(cwd: &Path, manifest: &Manifest, workspace: &WorkspaceGraph) -> anyhow::Result<()> {
+fn install_workspace(
+    cwd: &Path,
+    manifest: &Manifest,
+    workspace: &WorkspaceGraph,
+) -> anyhow::Result<()> {
     let registry = RegistryClient::new_default()?;
     let mut resolver = Resolver::new(registry);
     let resolved = resolver.resolve_workspace(cwd, manifest, workspace)?;
@@ -271,7 +278,13 @@ fn collect_required_by(lock: &KawkabLock, pkg: &LockPackage) -> Vec<WhyRequiredB
     let mut nodes = Vec::new();
     let mut visited = BTreeSet::new();
     visited.insert(format!("{}@{}", pkg.name, pkg.version));
-    collect_required_by_recursive(lock, pkg, vec![format!("{}@{}", pkg.name, pkg.version)], &mut visited, &mut nodes);
+    collect_required_by_recursive(
+        lock,
+        pkg,
+        vec![format!("{}@{}", pkg.name, pkg.version)],
+        &mut visited,
+        &mut nodes,
+    );
     nodes
 }
 
@@ -455,7 +468,10 @@ fn run_doctor(cwd: &Path, workspace: &WorkspaceGraph) -> DoctorReport {
     checks.push(DoctorCheck {
         name: "workspace_discovery".to_string(),
         ok: true,
-        message: format!("discovered {} workspace package(s)", workspace.packages.len()),
+        message: format!(
+            "discovered {} workspace package(s)",
+            workspace.packages.len()
+        ),
     });
 
     let cache = dirs::cache_dir()

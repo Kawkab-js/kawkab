@@ -165,8 +165,8 @@ dependencies = [
 name = "bridge"
 version = "0.1.0"
 dependencies = [
- "core",
  "hirofa-quickjs-sys",
+ "kawkab-core",
 ]
 
 [[package]]
@@ -314,28 +314,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "543d1dd138ef086e2ff05e3a48cf9da045da2033d16f8538fd76b86cd49b2ca3"
 dependencies = [
  "walkdir",
-]
-
-[[package]]
-name = "core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "blake3",
- "bytes",
- "crossbeam-channel",
- "flate2",
- "getrandom 0.2.17",
- "hirofa-quickjs-sys",
- "httparse",
- "io",
- "libc",
- "ring 0.16.20",
- "swc_core",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1041,9 +1019,9 @@ dependencies = [
  "blake3",
  "bridge",
  "cc",
- "core",
  "hirofa-quickjs-sys",
  "io",
+ "kawkab-core",
  "mimalloc",
  "num_cpus",
  "pm",
@@ -1052,6 +1030,28 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "kawkab-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "blake3",
+ "bytes",
+ "crossbeam-channel",
+ "flate2",
+ "getrandom 0.2.17",
+ "hirofa-quickjs-sys",
+ "httparse",
+ "io",
+ "libc",
+ "ring 0.16.20",
+ "swc_core",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1905,7 +1905,6 @@ name = "snapshot"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "core",
  "hirofa-quickjs-sys",
  "memmap2",
  "thiserror 1.0.69",

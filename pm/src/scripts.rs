@@ -40,7 +40,9 @@ impl ScriptRunner {
         }
         command.env("PATH", new_path);
 
-        let status = command.status().context("failed to launch script process")?;
+        let status = command
+            .status()
+            .context("failed to launch script process")?;
         if status.success() {
             Ok(())
         } else {

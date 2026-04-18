@@ -6,8 +6,8 @@ use std::{
 
 use quickjs_sys as qjs;
 
-use crate::ffi::{js_free_value, set_function, with_js_string};
 use crate::error::JsError;
+use crate::ffi::{js_free_value, set_function, with_js_string};
 
 #[inline]
 fn js_undefined() -> qjs::JSValue {

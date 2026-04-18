@@ -11,10 +11,11 @@ Current state of this repository:
 
 ## Project Structure
 
-- `core`: Core Kawkab runtime logic (currently simplified).
+- `core`: Rust package **`kawkab-core`** — core runtime logic (QuickJS integration, Node-style bootstrap, loaders, transpiler).
 - `bridge`: Integration/bridge layer (console bridge install hook + explicit flush helpers).
 - `io`: I/O layer, with optional `tokio-uring` feature support and async file driver baseline.
 - `snapshot`: Experimental snapshot manifest writer (`snapshot/src/lib.rs`) with validated context/error reporting.
+- `pm`: Native package manager library (`package.json`, lockfile, install, `why` / `doctor` helpers) consumed by the CLI.
 - `kawkab`: Executable crate (`kawkab-cli`) that produces the `kawkab` binary.
 
 ## Requirements

@@ -24,17 +24,11 @@ pub enum Task {
         reply: oneshot::Sender<Result<String, JsError>>,
     },
     /// Resolve pending Promise with bytes.
-    ResolvePromise {
-        promise_id: u64,
-        payload: Arc<[u8]>,
-    },
+    ResolvePromise { promise_id: u64, payload: Arc<[u8]> },
     /// Resolve pending Promise with `undefined`.
     ResolvePromiseVoid { promise_id: u64 },
     /// Resolve pending Promise with JSON string.
-    ResolvePromiseJson {
-        promise_id: u64,
-        json: String,
-    },
+    ResolvePromiseJson { promise_id: u64, json: String },
     /// Reject pending Promise.
     RejectPromise { promise_id: u64, reason: String },
     /// Accepted HTTP connection to handle on isolate thread.
@@ -141,26 +135,54 @@ impl EventLoop {
                 reply,
             } => {
                 let s = String::from_utf8_lossy(&src);
-                let transpiled = crate::transpiler::transpile_ts(&s, &filename).unwrap_or_else(|_| s.into_owned());
+                let transpiled = crate::transpiler::transpile_ts(&s, &filename)
+                    .unwrap_or_else(|_| s.into_owned());
 
-                let wrapper = format!("(function(exports, require, module, __filename, __dirname) {{\n{}\n}})", transpiled);
+                let wrapper = format!(
+                    "(function(exports, require, module, __filename, __dirname) {{\n{}\n}})",
+                    transpiled
+                );
                 let result = match self.isolate.eval(wrapper.as_bytes(), &filename) {
                     Ok(func_val) => unsafe {
                         let ctx = self.isolate.ctx_ptr();
                         let global = qjs::JS_GetGlobalObject(ctx);
                         let module_obj = qjs::JS_NewObject(ctx);
                         let exports_obj = qjs::JS_NewObject(ctx);
-                        qjs::JS_SetPropertyStr(ctx, module_obj, std::ffi::CString::new("exports").unwrap().as_ptr(), exports_obj);
+                        qjs::JS_SetPropertyStr(
+                            ctx,
+                            module_obj,
+                            std::ffi::CString::new("exports").unwrap().as_ptr(),
+                            exports_obj,
+                        );
 
-                        let require_fn = qjs::JS_GetPropertyStr(ctx, global, std::ffi::CString::new("require").unwrap().as_ptr());
-                        let filename_val = qjs_compat::new_string_from_cstr(ctx, std::ffi::CString::new(filename.as_ref()).unwrap().as_ptr());
-                        let dir = std::path::Path::new(&*filename).parent().unwrap_or(std::path::Path::new(".")).to_string_lossy();
-                        let dirname_val = qjs_compat::new_string_from_cstr(ctx, std::ffi::CString::new(dir.as_ref()).unwrap().as_ptr());
+                        let require_fn = qjs::JS_GetPropertyStr(
+                            ctx,
+                            global,
+                            std::ffi::CString::new("require").unwrap().as_ptr(),
+                        );
+                        let filename_val = qjs_compat::new_string_from_cstr(
+                            ctx,
+                            std::ffi::CString::new(filename.as_ref()).unwrap().as_ptr(),
+                        );
+                        let dir = std::path::Path::new(&*filename)
+                            .parent()
+                            .unwrap_or(std::path::Path::new("."))
+                            .to_string_lossy();
+                        let dirname_val = qjs_compat::new_string_from_cstr(
+                            ctx,
+                            std::ffi::CString::new(dir.as_ref()).unwrap().as_ptr(),
+                        );
 
                         let exports_arg = crate::ffi::js_dup_value(exports_obj);
                         let module_arg = crate::ffi::js_dup_value(module_obj);
 
-                        let mut args = [exports_arg, require_fn, module_arg, filename_val, dirname_val];
+                        let mut args = [
+                            exports_arg,
+                            require_fn,
+                            module_arg,
+                            filename_val,
+                            dirname_val,
+                        ];
                         let ret = qjs::JS_Call(ctx, func_val, global, 5, args.as_mut_ptr());
 
                         crate::ffi::js_free_value(ctx, func_val);
@@ -262,16 +284,14 @@ impl EventLoop {
     fn resolve_promise(&mut self, promise_id: u64, payload: Arc<[u8]>) -> Result<(), JsError> {
         unsafe {
             let ctx = self.isolate.ctx_ptr();
-            crate::node::host_resolve_promise(ctx, promise_id, payload)
-                .map_err(|e| JsError::Js(e))
+            crate::node::host_resolve_promise(ctx, promise_id, payload).map_err(|e| JsError::Js(e))
         }
     }
 
     fn resolve_promise_void(&mut self, promise_id: u64) -> Result<(), JsError> {
         unsafe {
             let ctx = self.isolate.ctx_ptr();
-            crate::node::host_resolve_capability_void(ctx, promise_id)
-                .map_err(|e| JsError::Js(e))
+            crate::node::host_resolve_capability_void(ctx, promise_id).map_err(|e| JsError::Js(e))
         }
     }
 
@@ -286,8 +306,7 @@ impl EventLoop {
     fn reject_promise(&mut self, promise_id: u64, reason: &str) -> Result<(), JsError> {
         unsafe {
             let ctx = self.isolate.ctx_ptr();
-            crate::node::host_reject_promise(ctx, promise_id, reason)
-                .map_err(|e| JsError::Js(e))
+            crate::node::host_reject_promise(ctx, promise_id, reason).map_err(|e| JsError::Js(e))
         }
     }
 }
@@ -351,7 +370,9 @@ impl TaskSender {
     }
 
     pub fn resolve_promise_json(&self, promise_id: u64, json: String) {
-        let _ = self.inner.send(Task::ResolvePromiseJson { promise_id, json });
+        let _ = self
+            .inner
+            .send(Task::ResolvePromiseJson { promise_id, json });
     }
 
     /// Reject pending Promise.

@@ -32,9 +32,7 @@ unsafe extern "C" fn normalize_module(
     module_name: *const c_char,
     _opaque: *mut c_void,
 ) -> *mut c_char {
-    let name = CStr::from_ptr(module_name)
-        .to_string_lossy()
-        .into_owned();
+    let name = CStr::from_ptr(module_name).to_string_lossy().into_owned();
 
     let resolved = if name.starts_with('/') {
         name.clone()
@@ -42,7 +40,9 @@ unsafe extern "C" fn normalize_module(
         let base = if module_base_name.is_null() {
             ".".to_string()
         } else {
-            CStr::from_ptr(module_base_name).to_string_lossy().into_owned()
+            CStr::from_ptr(module_base_name)
+                .to_string_lossy()
+                .into_owned()
         };
 
         let base_dir = if Path::new(&base).is_file() || base.contains('.') {
@@ -57,11 +57,7 @@ unsafe extern "C" fn normalize_module(
         let path = Path::new(&base_dir).join(&name);
         match std::fs::canonicalize(&path) {
             Ok(abs) => abs.to_string_lossy().into_owned(),
-            Err(_) => resolve_module_path_with_kind(
-                &base_dir,
-                &name,
-                ModuleResolutionKind::Esm,
-            ),
+            Err(_) => resolve_module_path_with_kind(&base_dir, &name, ModuleResolutionKind::Esm),
         }
     };
 
@@ -80,9 +76,7 @@ unsafe extern "C" fn load_module(
     module_name: *const c_char,
     _opaque: *mut c_void,
 ) -> *mut qjs::JSModuleDef {
-    let path = CStr::from_ptr(module_name)
-        .to_string_lossy()
-        .into_owned();
+    let path = CStr::from_ptr(module_name).to_string_lossy().into_owned();
 
     if path.ends_with(".json") {
         return load_json_module(ctx, &path);
@@ -115,8 +109,8 @@ unsafe fn load_esm_module(
     let mut js_source = match crate::transpiler::strip_types_only(source, path) {
         Ok(s) => s,
         Err(e) => {
-            let msg = CString::new(format!("ESM transpile error '{}': {}", path, e))
-                .unwrap_or_default();
+            let msg =
+                CString::new(format!("ESM transpile error '{}': {}", path, e)).unwrap_or_default();
             qjs::JS_ThrowSyntaxError(ctx, msg.as_ptr());
             return std::ptr::null_mut();
         }
@@ -173,7 +167,8 @@ unsafe fn load_cjs_as_esm_module(
         }
 
         CJS_NS_CACHE.with(|c| {
-            c.borrow_mut().insert(path.to_string(), js_dup_value(cjs_exports));
+            c.borrow_mut()
+                .insert(path.to_string(), js_dup_value(cjs_exports));
         });
         cjs_exports
     };
@@ -182,17 +177,18 @@ unsafe fn load_cjs_as_esm_module(
 }
 
 /// Execute CJS wrapper and return final `module.exports`.
-unsafe fn eval_cjs_source(
-    ctx: *mut qjs::JSContext,
-    js_source: &str,
-    path: &str,
-) -> qjs::JSValue {
+unsafe fn eval_cjs_source(ctx: *mut qjs::JSContext, js_source: &str, path: &str) -> qjs::JSValue {
     let global = qjs::JS_GetGlobalObject(ctx);
     let module_obj = qjs::JS_NewObject(ctx);
     let exports_obj = qjs::JS_NewObject(ctx);
 
     let exports_key = CString::new("exports").unwrap();
-    qjs::JS_SetPropertyStr(ctx, module_obj, exports_key.as_ptr(), js_dup_value(exports_obj));
+    qjs::JS_SetPropertyStr(
+        ctx,
+        module_obj,
+        exports_key.as_ptr(),
+        js_dup_value(exports_obj),
+    );
 
     let dir = Path::new(path)
         .parent()
@@ -227,9 +223,15 @@ unsafe fn eval_cjs_source(
     let dirname_val = qjs_compat::new_string_from_str(ctx, &dir);
 
     let exports_arg = js_dup_value(exports_obj);
-    let module_arg  = js_dup_value(module_obj);
+    let module_arg = js_dup_value(module_obj);
 
-    let mut args = [exports_arg, require_fn, module_arg, filename_val, dirname_val];
+    let mut args = [
+        exports_arg,
+        require_fn,
+        module_arg,
+        filename_val,
+        dirname_val,
+    ];
     let ret = qjs::JS_Call(ctx, func_val, global, 5, args.as_mut_ptr());
 
     js_free_value(ctx, func_val);
@@ -284,10 +286,7 @@ unsafe fn build_synthetic_cjs_module(
 
     let c_path = CString::new(path).unwrap_or_default();
 
-    unsafe extern "C" fn noop_init(
-        _ctx: *mut qjs::JSContext,
-        _m: *mut qjs::JSModuleDef,
-    ) -> i32 {
+    unsafe extern "C" fn noop_init(_ctx: *mut qjs::JSContext, _m: *mut qjs::JSModuleDef) -> i32 {
         0
     }
 
@@ -307,7 +306,9 @@ unsafe fn build_synthetic_cjs_module(
 
     qjs::JS_SetModuleExport(ctx, m, default_key.as_ptr(), js_dup_value(exports_obj));
     for name in &prop_names {
-        if name == "default" { continue; }
+        if name == "default" {
+            continue;
+        }
         if let Ok(cn) = CString::new(name.clone()) {
             let val = qjs::JS_GetPropertyStr(ctx, exports_obj, cn.as_ptr());
             qjs::JS_SetModuleExport(ctx, m, cn.as_ptr(), val);
@@ -322,7 +323,8 @@ unsafe fn load_json_module(ctx: *mut qjs::JSContext, path: &str) -> *mut qjs::JS
     let source = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
-            let msg = CString::new(format!("Cannot read JSON '{}': {}", path, e)).unwrap_or_default();
+            let msg =
+                CString::new(format!("Cannot read JSON '{}': {}", path, e)).unwrap_or_default();
             qjs::JS_ThrowReferenceError(ctx, msg.as_ptr());
             return std::ptr::null_mut();
         }
@@ -374,7 +376,11 @@ pub unsafe fn install_import_meta(ctx: *mut qjs::JSContext, m: *mut qjs::JSModul
 }
 
 /// Attach `import.meta.resolve`.
-unsafe fn install_import_meta_resolve(ctx: *mut qjs::JSContext, meta: qjs::JSValue, base_dir: &str) {
+unsafe fn install_import_meta_resolve(
+    ctx: *mut qjs::JSContext,
+    meta: qjs::JSValue,
+    base_dir: &str,
+) {
     let base_dir_val = qjs_compat::new_string_from_str(ctx, base_dir);
     let resolve_fn = qjs::JS_NewCFunctionData(
         ctx,
@@ -398,16 +404,15 @@ unsafe extern "C" fn js_import_meta_resolve(
     data: *mut qjs::JSValue,
 ) -> qjs::JSValue {
     if argc < 1 {
-        return qjs::JS_ThrowTypeError(ctx, b"resolve(specifier) requires primary argument\0".as_ptr() as *const i8);
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            b"resolve(specifier) requires primary argument\0".as_ptr() as *const i8,
+        );
     }
     let specifier = js_string_to_owned(ctx, *argv);
     let base_dir = js_string_to_owned(ctx, *data);
 
-    let resolved = resolve_module_path_with_kind(
-        &base_dir,
-        &specifier,
-        ModuleResolutionKind::Esm,
-    );
+    let resolved = resolve_module_path_with_kind(&base_dir, &specifier, ModuleResolutionKind::Esm);
     let url = format!("file://{}", resolved);
     qjs_compat::new_string_from_str(ctx, &url)
 }
@@ -448,17 +453,28 @@ pub unsafe fn eval_esm_entry(
     if func_val.tag == qjs::JS_TAG_EXCEPTION as i64 {
         let exc = qjs::JS_GetException(ctx);
         let msg = js_string_to_owned(ctx, exc);
-        
+
         let line_val = qjs::JS_GetPropertyStr(ctx, exc, b"lineNumber\0".as_ptr() as *const i8);
-        let line = if line_val.tag == qjs::JS_TAG_INT as i64 { line_val.u.int32 } else { -1 };
+        let line = if line_val.tag == qjs::JS_TAG_INT as i64 {
+            line_val.u.int32
+        } else {
+            -1
+        };
         js_free_value(ctx, line_val);
 
         let file_val = qjs::JS_GetPropertyStr(ctx, exc, b"fileName\0".as_ptr() as *const i8);
-        let file_name = if qjs::JS_IsString(file_val) { js_string_to_owned(ctx, file_val) } else { "unknown".to_string() };
+        let file_name = if qjs::JS_IsString(file_val) {
+            js_string_to_owned(ctx, file_val)
+        } else {
+            "unknown".to_string()
+        };
         js_free_value(ctx, file_val);
 
         js_free_value(ctx, exc);
-        return Err(JsError::Compile(format!("ESM compile error in '{}' at line {}: {}", file_name, line, msg)));
+        return Err(JsError::Compile(format!(
+            "ESM compile error in '{}' at line {}: {}",
+            file_name, line, msg
+        )));
     }
 
     let m = func_val.u.ptr as *mut qjs::JSModuleDef;
@@ -514,7 +530,9 @@ pub unsafe fn require_esm_as_cjs(
         let js_str = qjs::JS_AtomToString(ctx, atom);
         let name = js_string_to_owned(ctx, js_str);
         js_free_value(ctx, js_str);
-        if name.is_empty() { continue; }
+        if name.is_empty() {
+            continue;
+        }
 
         let val = qjs::JS_GetPropertyStr(
             ctx,

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
-use core::ffi::{js_free_value, js_string_to_owned};
+use kawkab_core::ffi::{js_free_value, js_string_to_owned};
 use quickjs_sys as qjs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,9 +63,9 @@ fn load_source_for_runtime(file: &PathBuf) -> anyhow::Result<LoadedSource> {
         .with_context(|| format!("failed to read {}", file.display()))?;
     let filename = file.to_string_lossy().to_string();
 
-    let src_type = core::node::module_loader::detect_source_type(&filename, &raw);
-    let is_json = src_type == core::node::module_loader::SourceType::Json;
-    let is_esm = src_type == core::node::module_loader::SourceType::Esm;
+    let src_type = kawkab_core::node::module_loader::detect_source_type(&filename, &raw);
+    let is_json = src_type == kawkab_core::node::module_loader::SourceType::Json;
+    let is_esm = src_type == kawkab_core::node::module_loader::SourceType::Esm;
 
     if is_json {
         let exec_src = raw.into_bytes();
@@ -79,7 +79,7 @@ fn load_source_for_runtime(file: &PathBuf) -> anyhow::Result<LoadedSource> {
     }
 
     if is_esm {
-        let js = core::transpiler::strip_types_only(&raw, &filename)
+        let js = kawkab_core::transpiler::strip_types_only(&raw, &filename)
             .with_context(|| format!("failed to transpile ESM {}", file.display()))?;
 
         if std::env::var("KAWKAB_DEBUG").is_ok() {
@@ -100,9 +100,12 @@ fn load_source_for_runtime(file: &PathBuf) -> anyhow::Result<LoadedSource> {
         });
     }
 
-    let ext = file.extension().and_then(|v| v.to_str()).unwrap_or_default();
+    let ext = file
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default();
     let js = if matches!(ext, "ts" | "tsx" | "jsx") {
-        core::transpiler::transpile_ts(&raw, &filename)
+        kawkab_core::transpiler::transpile_ts(&raw, &filename)
             .with_context(|| format!("failed to transpile {}", file.display()))?
     } else {
         raw.clone()
@@ -236,7 +239,9 @@ fn parse_pm_command(args: &[String]) -> anyhow::Result<Option<pm::PmCommand>> {
         "outdated" => Ok(Some(pm::PmCommand::Outdated)),
         "why" => {
             let Some(name) = args.get(1) else {
-                anyhow::bail!("usage: kawkab why <package> [--json] [--pretty=false] [--json-schema]");
+                anyhow::bail!(
+                    "usage: kawkab why <package> [--json] [--pretty=false] [--json-schema]"
+                );
             };
             let json = args.iter().any(|a| a == "--json");
             let pretty = !args.iter().any(|a| a == "--pretty=false");
@@ -295,7 +300,12 @@ fn run_with_quickjs(
     let result = rt.block_on(async move {
         let local = tokio::task::LocalSet::new();
         local
-            .run_until(run_quickjs_inner(loaded, filename, allow_node_fallback, verbose))
+            .run_until(run_quickjs_inner(
+                loaded,
+                filename,
+                allow_node_fallback,
+                verbose,
+            ))
             .await
     });
 
@@ -308,13 +318,14 @@ async fn run_quickjs_inner(
     allow_node_fallback: bool,
     verbose: bool,
 ) -> anyhow::Result<()> {
-    use core::{
+    use kawkab_core::{
         event_loop::TaskSender,
         isolate::{Isolate, IsolateConfig},
     };
 
-    let mut isolate = Isolate::new(IsolateConfig::default()).context("failed to create QuickJS isolate")?;
-    core::console::install(&mut isolate).context("failed to install console")?;
+    let mut isolate =
+        Isolate::new(IsolateConfig::default()).context("failed to create QuickJS isolate")?;
+    kawkab_core::console::install(&mut isolate).context("failed to install console")?;
     let ctx = isolate.ctx_ptr();
 
     let filename_abs = std::fs::canonicalize(filename)
@@ -323,16 +334,17 @@ async fn run_quickjs_inner(
     let filename = &filename_abs;
 
     let _rt_handle = tokio::runtime::Handle::current();
-    let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel::<core::event_loop::Task>();
+    let (task_tx, mut task_rx) =
+        tokio::sync::mpsc::unbounded_channel::<kawkab_core::event_loop::Task>();
     let sender = TaskSender::from_sender(task_tx.clone());
 
     unsafe {
-        core::node::install_runtime(ctx, filename, Some(sender))
+        kawkab_core::node::install_runtime(ctx, filename, Some(sender))
             .map_err(|e| anyhow::anyhow!(e))?;
     }
 
     let eval_val = if loaded.is_esm {
-        match unsafe { core::node::eval_esm_entry(ctx, filename) } {
+        match unsafe { kawkab_core::node::eval_esm_entry(ctx, filename) } {
             Ok(v) => v,
             Err(e) => {
                 if allow_node_fallback {
@@ -399,8 +411,9 @@ async fn run_quickjs_inner(
             continue;
         }
 
-        let pending = core::node::PENDING_ASYNC_TIMERS.load(std::sync::atomic::Ordering::Relaxed)
-            + core::node::PENDING_HOST_ASYNC.load(std::sync::atomic::Ordering::Relaxed);
+        let pending = kawkab_core::node::PENDING_ASYNC_TIMERS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            + kawkab_core::node::PENDING_HOST_ASYNC.load(std::sync::atomic::Ordering::Relaxed);
         if pending == 0 {
             break;
         }
@@ -413,37 +426,39 @@ async fn run_quickjs_inner(
 
     unsafe { js_free_value(ctx, eval_val) };
 
-    core::console::flush_all();
+    kawkab_core::console::flush_all();
     unsafe {
-        core::node::clear_module_caches(ctx);
+        kawkab_core::node::clear_module_caches(ctx);
     }
 
     Ok(())
 }
 
 /// CLI path: run one event-loop task on the QuickJS context.
-fn handle_cli_task(ctx: *mut qjs::JSContext, task: core::event_loop::Task) {
-    use core::event_loop::Task;
+fn handle_cli_task(ctx: *mut qjs::JSContext, task: kawkab_core::event_loop::Task) {
+    use kawkab_core::event_loop::Task;
     match task {
         Task::TimerCallback { timer_id } => unsafe {
-            let _ = core::node::dispatch_timer_callback(ctx, timer_id);
+            let _ = kawkab_core::node::dispatch_timer_callback(ctx, timer_id);
         },
-        Task::ResolvePromise { promise_id, payload } => unsafe {
-            let _ = core::node::host_resolve_promise(ctx, promise_id, payload);
+        Task::ResolvePromise {
+            promise_id,
+            payload,
+        } => unsafe {
+            let _ = kawkab_core::node::host_resolve_promise(ctx, promise_id, payload);
         },
         Task::ResolvePromiseVoid { promise_id } => unsafe {
-            let _ = core::node::host_resolve_capability_void(ctx, promise_id);
+            let _ = kawkab_core::node::host_resolve_capability_void(ctx, promise_id);
         },
         Task::ResolvePromiseJson { promise_id, json } => unsafe {
-            let _ = core::node::host_resolve_promise_json(ctx, promise_id, &json);
+            let _ = kawkab_core::node::host_resolve_promise_json(ctx, promise_id, &json);
         },
         Task::RejectPromise { promise_id, reason } => unsafe {
-            let _ = core::node::host_reject_promise(ctx, promise_id, &reason);
+            let _ = kawkab_core::node::host_reject_promise(ctx, promise_id, &reason);
         },
         _ => {}
     }
 }
-
 
 /// Ensure compiled CJS sees `Buffer` by seeding it from `globalThis` before bytecode compile.
 fn cjs_bytecode_source(exec_src: &[u8]) -> Vec<u8> {
@@ -465,11 +480,11 @@ fn eval_with_bytecode_cache(
 
     if !skip_disk {
         let cache_dir = bytecode_cache_dir();
-        let disk = core::bytecode::DiskCache::new(&cache_dir)
+        let disk = kawkab_core::bytecode::DiskCache::new(&cache_dir)
             .with_context(|| format!("failed to init bytecode cache at {}", cache_dir.display()))?;
 
         let canonical = canonical_for_key(filename);
-        let key = core::bytecode::DiskCache::cache_key(&canonical, cache_material);
+        let key = kawkab_core::bytecode::DiskCache::cache_key(&canonical, cache_material);
         if let Some(bc) = disk
             .load(&key)
             .context("failed to read bytecode cache entry")?
@@ -477,7 +492,7 @@ fn eval_with_bytecode_cache(
             if verbose {
                 eprintln!("[quickjs] bytecode cache hit");
             }
-            let v = unsafe { core::bytecode::exec(ctx, &bc) }
+            let v = unsafe { kawkab_core::bytecode::exec(ctx, &bc) }
                 .map_err(|e| anyhow::anyhow!("bytecode exec failed: {e}"))?;
             return Ok(v);
         }
@@ -486,10 +501,10 @@ fn eval_with_bytecode_cache(
             eprintln!("[quickjs] bytecode cache miss -> compile");
         }
         let src = cjs_bytecode_source(exec_src);
-        let bc = core::bytecode::compile(ctx, &src, filename)
+        let bc = kawkab_core::bytecode::compile(ctx, &src, filename)
             .map_err(|e| anyhow::anyhow!("bytecode compile failed: {e}"))?;
         let _ = disk.store(&key, &bc);
-        let v = unsafe { core::bytecode::exec(ctx, &bc) }
+        let v = unsafe { kawkab_core::bytecode::exec(ctx, &bc) }
             .map_err(|e| anyhow::anyhow!("bytecode exec failed: {e}"))?;
         return Ok(v);
     }
@@ -498,9 +513,9 @@ fn eval_with_bytecode_cache(
         eprintln!("[quickjs] bytecode disk cache skipped (KAWKAB_SKIP_BYTECODE=1)");
     }
     let src = cjs_bytecode_source(exec_src);
-    let bc = core::bytecode::compile(ctx, &src, filename)
+    let bc = kawkab_core::bytecode::compile(ctx, &src, filename)
         .map_err(|e| anyhow::anyhow!("bytecode compile failed: {e}"))?;
-    let v = unsafe { core::bytecode::exec(ctx, &bc) }
+    let v = unsafe { kawkab_core::bytecode::exec(ctx, &bc) }
         .map_err(|e| anyhow::anyhow!("bytecode exec failed: {e}"))?;
     Ok(v)
 }

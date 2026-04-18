@@ -131,7 +131,13 @@ pub unsafe fn install(ctx: *mut qjs::JSContext, global: qjs::JSValue) -> Result<
         Some(js_buffer_alloc_unsafe),
         1,
     )?;
-    install_c_fn(ctx, global, "__kawkabBufferConcat", Some(js_buffer_concat), 2)?;
+    install_c_fn(
+        ctx,
+        global,
+        "__kawkabBufferConcat",
+        Some(js_buffer_concat),
+        2,
+    )?;
     install_c_fn(
         ctx,
         global,
@@ -204,7 +210,10 @@ pub(crate) fn string_to_buffer_bytes(s: &str, enc: &str) -> Result<Vec<u8>, Stri
     }
 }
 
-unsafe fn typed_array_view_byte_len(ctx: *mut qjs::JSContext, value: qjs::JSValue) -> Option<usize> {
+unsafe fn typed_array_view_byte_len(
+    ctx: *mut qjs::JSContext,
+    value: qjs::JSValue,
+) -> Option<usize> {
     if value.tag != qjs::JS_TAG_OBJECT as i64 {
         return None;
     }

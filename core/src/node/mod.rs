@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::ptr;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, UdpSocket};
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
@@ -31,7 +31,7 @@ pub mod module_loader;
 mod process;
 mod runtime_policy;
 
-pub use esm_loader::{eval_esm_entry, clear_module_caches};
+pub use esm_loader::{clear_module_caches, eval_esm_entry};
 
 struct HttpListenEntry {
     server_obj: qjs::JSValue,
@@ -181,7 +181,13 @@ pub unsafe fn install_runtime(
     install_c_fn(ctx, global, "__kawkabPlatform", Some(js_get_platform), 0)?;
     install_c_fn(ctx, global, "__kawkabRunCommand", Some(js_run_command), 1)?;
     install_c_fn(ctx, global, "__kawkabSleepMs", Some(js_sleep_ms), 1)?;
-    install_c_fn(ctx, global, "__kawkabNextPromiseId", Some(js_next_promise_id), 0)?;
+    install_c_fn(
+        ctx,
+        global,
+        "__kawkabNextPromiseId",
+        Some(js_next_promise_id),
+        0,
+    )?;
     install_c_fn(
         ctx,
         global,
@@ -190,7 +196,13 @@ pub unsafe fn install_runtime(
         2,
     )?;
 
-    install_c_fn(ctx, global, "__kawkabCryptoRandomBytes", Some(js_crypto_random_bytes), 2)?;
+    install_c_fn(
+        ctx,
+        global,
+        "__kawkabCryptoRandomBytes",
+        Some(js_crypto_random_bytes),
+        2,
+    )?;
     install_c_fn(
         ctx,
         global,
@@ -198,10 +210,34 @@ pub unsafe fn install_runtime(
         Some(js_crypto_random_bytes_sync),
         1,
     )?;
-    install_c_fn(ctx, global, "__kawkabCryptoCreateHash", Some(js_crypto_create_hash), 1)?;
-    install_c_fn(ctx, global, "__kawkabCryptoCreateHmac", Some(js_crypto_create_hmac), 2)?;
-    install_c_fn(ctx, global, "__kawkabCryptoUpdate", Some(js_crypto_update), 2)?;
-    install_c_fn(ctx, global, "__kawkabCryptoDigest", Some(js_crypto_digest), 1)?;
+    install_c_fn(
+        ctx,
+        global,
+        "__kawkabCryptoCreateHash",
+        Some(js_crypto_create_hash),
+        1,
+    )?;
+    install_c_fn(
+        ctx,
+        global,
+        "__kawkabCryptoCreateHmac",
+        Some(js_crypto_create_hmac),
+        2,
+    )?;
+    install_c_fn(
+        ctx,
+        global,
+        "__kawkabCryptoUpdate",
+        Some(js_crypto_update),
+        2,
+    )?;
+    install_c_fn(
+        ctx,
+        global,
+        "__kawkabCryptoDigest",
+        Some(js_crypto_digest),
+        1,
+    )?;
     install_c_fn(ctx, global, "setTimeout", Some(js_set_timeout), 2)?;
 
     install_c_fn(ctx, global, "clearTimeout", Some(js_clear_timeout), 1)?;
@@ -377,11 +413,29 @@ pub unsafe fn install_runtime(
         "querystring",
         QUERYSTRING_SHIM_SRC,
     )?;
-    prime_eval_shim_exports(ctx, global, "__kawkabPrimedCrypto", "crypto", CRYPTO_SHIM_SRC)?;
+    prime_eval_shim_exports(
+        ctx,
+        global,
+        "__kawkabPrimedCrypto",
+        "crypto",
+        CRYPTO_SHIM_SRC,
+    )?;
     prime_eval_shim_exports(ctx, global, "__kawkabPrimedUrl", "url", URL_SHIM_SRC)?;
     prime_timers_promises_exports_native(ctx, global)?;
-    prime_eval_shim_exports(ctx, global, "__kawkabPrimedStream", "stream", STREAM_SHIM_SRC)?;
-    prime_eval_shim_exports(ctx, global, "__kawkabPrimedEvents", "events", EVENTS_SHIM_SRC)?;
+    prime_eval_shim_exports(
+        ctx,
+        global,
+        "__kawkabPrimedStream",
+        "stream",
+        STREAM_SHIM_SRC,
+    )?;
+    prime_eval_shim_exports(
+        ctx,
+        global,
+        "__kawkabPrimedEvents",
+        "events",
+        EVENTS_SHIM_SRC,
+    )?;
     patch_eventemitter_prototype(ctx, global)?;
 
     buffer::install(ctx, global)?;
@@ -995,7 +1049,6 @@ return {
 };
 "#;
 
-
 const URL_SHIM_SRC: &str = r#"
 function QS(init) {
   this._pairs = [];
@@ -1200,10 +1253,7 @@ fn base64_decode_char(c: u8) -> Option<u8> {
 }
 
 fn base64_decode_data(s: &str) -> Result<Vec<u8>, ()> {
-    let mut bytes: Vec<u8> = s
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
+    let mut bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     while !bytes.is_empty() && bytes.len() % 4 != 0 {
         bytes.push(b'=');
     }
@@ -1268,7 +1318,9 @@ unsafe extern "C" fn js_global_atob(
         Err(()) => {
             return qjs::JS_ThrowTypeError(
                 ctx,
-                CString::new("atob failed: invalid character").unwrap().as_ptr(),
+                CString::new("atob failed: invalid character")
+                    .unwrap()
+                    .as_ptr(),
             );
         }
     };
@@ -1285,7 +1337,9 @@ unsafe extern "C" fn js_global_structured_clone_json(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(
             ctx,
-            CString::new("structuredClone requires a value").unwrap().as_ptr(),
+            CString::new("structuredClone requires a value")
+                .unwrap()
+                .as_ptr(),
         );
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
@@ -1299,11 +1353,8 @@ unsafe extern "C" fn js_global_structured_clone_json(
             CString::new("JSON is not available").unwrap().as_ptr(),
         );
     }
-    let stringify = qjs::JS_GetPropertyStr(
-        ctx,
-        json_o,
-        CString::new("stringify").unwrap().as_ptr(),
-    );
+    let stringify =
+        qjs::JS_GetPropertyStr(ctx, json_o, CString::new("stringify").unwrap().as_ptr());
     let parse = qjs::JS_GetPropertyStr(ctx, json_o, CString::new("parse").unwrap().as_ptr());
     js_free_value(ctx, json_o);
     if qjs::JS_IsFunction(ctx, stringify) == 0 || qjs::JS_IsFunction(ctx, parse) == 0 {
@@ -1311,17 +1362,13 @@ unsafe extern "C" fn js_global_structured_clone_json(
         js_free_value(ctx, parse);
         return qjs::JS_ThrowTypeError(
             ctx,
-            CString::new("JSON.stringify/parse missing").unwrap().as_ptr(),
+            CString::new("JSON.stringify/parse missing")
+                .unwrap()
+                .as_ptr(),
         );
     }
     let mut argv_s = [js_dup_value(args[0])];
-    let mid = qjs::JS_Call(
-        ctx,
-        stringify,
-        js_undefined(),
-        1,
-        argv_s.as_mut_ptr(),
-    );
+    let mid = qjs::JS_Call(ctx, stringify, js_undefined(), 1, argv_s.as_mut_ptr());
     js_free_value(ctx, stringify);
     js_free_value(ctx, argv_s[0]);
     if is_exception(mid) {
@@ -1865,9 +1912,14 @@ unsafe extern "C" fn js_dgram_sock_bind(
     let mut socket_id_i: i64 = 0;
     let _ = qjs::JS_ToInt64(ctx, &mut socket_id_i, socket_id_v);
     js_free_value(ctx, socket_id_v);
-    let socket_id = if socket_id_i > 0 { socket_id_i as u64 } else { 0 };
+    let socket_id = if socket_id_i > 0 {
+        socket_id_i as u64
+    } else {
+        0
+    };
 
-    let kind_v = qjs::JS_GetPropertyStr(ctx, this, CString::new("__kawkabUdpKind").unwrap().as_ptr());
+    let kind_v =
+        qjs::JS_GetPropertyStr(ctx, this, CString::new("__kawkabUdpKind").unwrap().as_ptr());
     let kind = js_string_to_owned(ctx, kind_v);
     js_free_value(ctx, kind_v);
     let default_host = if kind == "udp6" { "::" } else { "0.0.0.0" };
@@ -1952,9 +2004,16 @@ unsafe extern "C" fn js_dgram_sock_bind(
                     }
                     match rx_sock.recv_from(&mut buf) {
                         Ok((n, src)) => {
-                            sender.send_udp_message(socket_id, Arc::<[u8]>::from(buf[..n].to_vec()), src.ip().to_string(), src.port());
+                            sender.send_udp_message(
+                                socket_id,
+                                Arc::<[u8]>::from(buf[..n].to_vec()),
+                                src.ip().to_string(),
+                                src.port(),
+                            );
                         }
-                        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+                        Err(e)
+                            if e.kind() == ErrorKind::WouldBlock
+                                || e.kind() == ErrorKind::TimedOut => {}
                         Err(_) => break,
                     }
                 }
@@ -1980,7 +2039,15 @@ unsafe extern "C" fn js_dgram_sock_bind(
         }
         js_free_value(ctx, ret);
     }
-    dgram_emit(ctx, this, "listening", js_undefined(), false, js_undefined(), false);
+    dgram_emit(
+        ctx,
+        this,
+        "listening",
+        js_undefined(),
+        false,
+        js_undefined(),
+        false,
+    );
     js_dup_value(this)
 }
 
@@ -2042,10 +2109,17 @@ unsafe extern "C" fn js_dgram_sock_send(
     let end = offset.saturating_add(length).min(payload.len());
     payload = payload[offset..end].to_vec();
 
-    let kind_v = qjs::JS_GetPropertyStr(ctx, this, CString::new("__kawkabUdpKind").unwrap().as_ptr());
+    let kind_v =
+        qjs::JS_GetPropertyStr(ctx, this, CString::new("__kawkabUdpKind").unwrap().as_ptr());
     let kind = js_string_to_owned(ctx, kind_v);
     js_free_value(ctx, kind_v);
-    let target_host = host.unwrap_or_else(|| if kind == "udp6" { "::1".to_string() } else { "127.0.0.1".to_string() });
+    let target_host = host.unwrap_or_else(|| {
+        if kind == "udp6" {
+            "::1".to_string()
+        } else {
+            "127.0.0.1".to_string()
+        }
+    });
     let target = if target_host.contains(':') {
         format!("[{}]:{}", target_host, port.max(0))
     } else {
@@ -2060,14 +2134,22 @@ unsafe extern "C" fn js_dgram_sock_send(
     let mut socket_id_i: i64 = 0;
     let _ = qjs::JS_ToInt64(ctx, &mut socket_id_i, socket_id_v);
     js_free_value(ctx, socket_id_v);
-    let socket_id = if socket_id_i > 0 { socket_id_i as u64 } else { 0 };
+    let socket_id = if socket_id_i > 0 {
+        socket_id_i as u64
+    } else {
+        0
+    };
 
     let send_res: Result<usize, std::io::Error> = if let Some(sock) =
         DGRAM_NATIVE_SOCKET_REGISTRY.with(|reg| reg.borrow().get(&socket_id).cloned())
     {
         sock.send_to(&payload, &target)
     } else {
-        let bind_addr = if kind == "udp6" { "[::]:0" } else { "0.0.0.0:0" };
+        let bind_addr = if kind == "udp6" {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
         match UdpSocket::bind(bind_addr) {
             Ok(s) => s.send_to(&payload, &target),
             Err(e) => Err(e),
@@ -2084,7 +2166,8 @@ unsafe extern "C" fn js_dgram_sock_send(
             let mut bound_port_i: i64 = 0;
             let _ = qjs::JS_ToInt64(ctx, &mut bound_port_i, bound_port_v);
             js_free_value(ctx, bound_port_v);
-            let target_is_local = target_host == "127.0.0.1" || target_host == "::1" || target_host == "localhost";
+            let target_is_local =
+                target_host == "127.0.0.1" || target_host == "::1" || target_host == "localhost";
             if bound_port_i > 0 && port.max(0) == bound_port_i && target_is_local {
                 let payload_val = if payload.is_empty() {
                     qjs::JS_NewArrayBufferCopy(ctx, std::ptr::null(), 0)
@@ -2096,8 +2179,11 @@ unsafe extern "C" fn js_dgram_sock_send(
                     qjs::JS_GetPropertyStr(ctx, global, CString::new("Buffer").unwrap().as_ptr());
                 let mut msg = payload_val;
                 if qjs::JS_IsObject(buffer_ctor) {
-                    let from_fn =
-                        qjs::JS_GetPropertyStr(ctx, buffer_ctor, CString::new("from").unwrap().as_ptr());
+                    let from_fn = qjs::JS_GetPropertyStr(
+                        ctx,
+                        buffer_ctor,
+                        CString::new("from").unwrap().as_ptr(),
+                    );
                     if qjs::JS_IsFunction(ctx, from_fn) != 0 {
                         let mut argv = [js_dup_value(payload_val)];
                         let out = qjs::JS_Call(ctx, from_fn, buffer_ctor, 1, argv.as_mut_ptr());
@@ -2125,7 +2211,14 @@ unsafe extern "C" fn js_dgram_sock_send(
                     ctx,
                     rinfo,
                     CString::new("family").unwrap().as_ptr(),
-                    qjs_compat::new_string_from_str(ctx, if target_host.contains(':') { "IPv6" } else { "IPv4" }),
+                    qjs_compat::new_string_from_str(
+                        ctx,
+                        if target_host.contains(':') {
+                            "IPv6"
+                        } else {
+                            "IPv4"
+                        },
+                    ),
                 );
                 qjs::JS_SetPropertyStr(
                     ctx,
@@ -2235,7 +2328,15 @@ unsafe extern "C" fn js_dgram_sock_close(
         }
         js_free_value(ctx, ret);
     }
-    dgram_emit(ctx, this, "close", js_undefined(), false, js_undefined(), false);
+    dgram_emit(
+        ctx,
+        this,
+        "close",
+        js_undefined(),
+        false,
+        js_undefined(),
+        false,
+    );
     js_dup_value(this)
 }
 
@@ -2357,14 +2458,24 @@ unsafe extern "C" fn js_dgram_create_socket(
         qjs_compat::new_string_from_str(ctx, &kind),
     );
     qjs::JS_SetPropertyStr(ctx, sock, k_port.as_ptr(), qjs_compat::new_int(ctx, 0));
-    qjs::JS_SetPropertyStr(ctx, sock, k_id.as_ptr(), qjs_compat::new_int(ctx, id as i64));
+    qjs::JS_SetPropertyStr(
+        ctx,
+        sock,
+        k_id.as_ptr(),
+        qjs_compat::new_int(ctx, id as i64),
+    );
     qjs::JS_SetPropertyStr(
         ctx,
         sock,
         k_addr.as_ptr(),
         qjs_compat::new_string_from_str(ctx, if kind == "udp6" { "::" } else { "0.0.0.0" }),
     );
-    qjs::JS_SetPropertyStr(ctx, sock, k_err.as_ptr(), qjs_compat::new_string_from_str(ctx, ""));
+    qjs::JS_SetPropertyStr(
+        ctx,
+        sock,
+        k_err.as_ptr(),
+        qjs_compat::new_string_from_str(ctx, ""),
+    );
     qjs::JS_SetPropertyStr(ctx, sock, k_list.as_ptr(), qjs::JS_NewObject(ctx));
     dgram_install_socket_methods(ctx, sock);
     if args.len() > 1 && qjs::JS_IsFunction(ctx, args[1]) != 0 {
@@ -2438,7 +2549,13 @@ unsafe fn diag_ensure_channel(
     let _ = install_obj_fn(ctx, ch, "subscribe", Some(js_diag_channel_subscribe), 1);
     let _ = install_obj_fn(ctx, ch, "unsubscribe", Some(js_diag_channel_unsubscribe), 1);
     let _ = install_obj_fn(ctx, ch, "bindStore", Some(js_diag_channel_bind_store), 2);
-    let _ = install_obj_fn(ctx, ch, "unbindStore", Some(js_diag_channel_unbind_store), 1);
+    let _ = install_obj_fn(
+        ctx,
+        ch,
+        "unbindStore",
+        Some(js_diag_channel_unbind_store),
+        1,
+    );
     let _ = install_obj_fn(ctx, ch, "runStores", Some(js_diag_channel_run_stores), 3);
 
     qjs::JS_SetPropertyStr(ctx, store, cname.as_ptr(), js_dup_value(ch));
@@ -2563,9 +2680,11 @@ unsafe extern "C" fn js_diag_channel_bind_store(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(
             ctx,
-            CString::new("diagnostics_channel channel.bindStore(store[, transform]) requires store")
-                .unwrap()
-                .as_ptr(),
+            CString::new(
+                "diagnostics_channel channel.bindStore(store[, transform]) requires store",
+            )
+            .unwrap()
+            .as_ptr(),
         );
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
@@ -2588,8 +2707,7 @@ unsafe extern "C" fn js_diag_channel_bind_store(
     let mut i: i32 = 0;
     while i < len {
         let entry = qjs::JS_GetPropertyUint32(ctx, bounds, i as u32);
-        let cur_store =
-            qjs::JS_GetPropertyStr(ctx, entry, CString::new("store").unwrap().as_ptr());
+        let cur_store = qjs::JS_GetPropertyStr(ctx, entry, CString::new("store").unwrap().as_ptr());
         if qjs::JS_StrictEq(ctx, cur_store, store) != 0 {
             qjs::JS_SetPropertyStr(
                 ctx,
@@ -2690,9 +2808,11 @@ unsafe extern "C" fn js_diag_channel_run_stores(
     if argc < 2 {
         return qjs::JS_ThrowTypeError(
             ctx,
-            CString::new("diagnostics_channel.runStores(data, callback[, thisArg]) requires arguments")
-                .unwrap()
-                .as_ptr(),
+            CString::new(
+                "diagnostics_channel.runStores(data, callback[, thisArg]) requires arguments",
+            )
+            .unwrap()
+            .as_ptr(),
         );
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
@@ -2906,27 +3026,18 @@ unsafe extern "C" fn js_diag_unsubscribe(
 }
 
 unsafe fn diag_tracing_update_has_subscribers(ctx: *mut qjs::JSContext, tracing: qjs::JSValue) {
-    let start = qjs::JS_GetPropertyStr(
-        ctx,
-        tracing,
-        CString::new("start").unwrap().as_ptr(),
-    );
+    let start = qjs::JS_GetPropertyStr(ctx, tracing, CString::new("start").unwrap().as_ptr());
     let end = qjs::JS_GetPropertyStr(ctx, tracing, CString::new("end").unwrap().as_ptr());
-    let async_start = qjs::JS_GetPropertyStr(
-        ctx,
-        tracing,
-        CString::new("asyncStart").unwrap().as_ptr(),
-    );
-    let async_end = qjs::JS_GetPropertyStr(
-        ctx,
-        tracing,
-        CString::new("asyncEnd").unwrap().as_ptr(),
-    );
+    let async_start =
+        qjs::JS_GetPropertyStr(ctx, tracing, CString::new("asyncStart").unwrap().as_ptr());
+    let async_end =
+        qjs::JS_GetPropertyStr(ctx, tracing, CString::new("asyncEnd").unwrap().as_ptr());
     let error = qjs::JS_GetPropertyStr(ctx, tracing, CString::new("error").unwrap().as_ptr());
     let mut has = false;
     for ch in [start, end, async_start, async_end, error] {
         if !qjs::JS_IsUndefined(ch) {
-            let hs = qjs::JS_GetPropertyStr(ctx, ch, CString::new("hasSubscribers").unwrap().as_ptr());
+            let hs =
+                qjs::JS_GetPropertyStr(ctx, ch, CString::new("hasSubscribers").unwrap().as_ptr());
             has = has || qjs::JS_ToBool(ctx, hs) != 0;
             js_free_value(ctx, hs);
         }
@@ -3017,13 +3128,27 @@ unsafe extern "C" fn js_diag_tracing_trace_sync(
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
     if argc < 1 {
-        return qjs::JS_ThrowTypeError(ctx, CString::new("tracingChannel.traceSync requires fn").unwrap().as_ptr());
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("tracingChannel.traceSync requires fn")
+                .unwrap()
+                .as_ptr(),
+        );
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
     if qjs::JS_IsFunction(ctx, args[0]) == 0 {
-        return qjs::JS_ThrowTypeError(ctx, CString::new("tracingChannel.traceSync fn must be function").unwrap().as_ptr());
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("tracingChannel.traceSync fn must be function")
+                .unwrap()
+                .as_ptr(),
+        );
     }
-    let context = if argc > 1 { args[1] } else { qjs::JS_NewObject(ctx) };
+    let context = if argc > 1 {
+        args[1]
+    } else {
+        qjs::JS_NewObject(ctx)
+    };
     let this_arg = if argc > 2 { args[2] } else { js_undefined() };
     let rest_len = if argc > 3 { (argc - 3) as usize } else { 0 };
     let mut call_args = Vec::with_capacity(rest_len);
@@ -3045,7 +3170,13 @@ unsafe extern "C" fn js_diag_tracing_trace_sync(
             js_free_value(ctx, sret);
         }
     }
-    let ret = qjs::JS_Call(ctx, args[0], this_arg, call_args.len() as i32, call_args.as_mut_ptr());
+    let ret = qjs::JS_Call(
+        ctx,
+        args[0],
+        this_arg,
+        call_args.len() as i32,
+        call_args.as_mut_ptr(),
+    );
     for v in call_args {
         js_free_value(ctx, v);
     }
@@ -3087,13 +3218,15 @@ unsafe extern "C" fn js_diag_tracing_channel(
     let tracing = qjs::JS_NewObject(ctx);
     if qjs::JS_IsString(args[0]) {
         let base = js_string_to_owned(ctx, args[0]);
-        let start = diag_ensure_channel(ctx, &format!("tracing:{}:start", base)).unwrap_or_else(|e| e);
+        let start =
+            diag_ensure_channel(ctx, &format!("tracing:{}:start", base)).unwrap_or_else(|e| e);
         let end = diag_ensure_channel(ctx, &format!("tracing:{}:end", base)).unwrap_or_else(|e| e);
-        let async_start = diag_ensure_channel(ctx, &format!("tracing:{}:asyncStart", base))
-            .unwrap_or_else(|e| e);
-        let async_end = diag_ensure_channel(ctx, &format!("tracing:{}:asyncEnd", base))
-            .unwrap_or_else(|e| e);
-        let error = diag_ensure_channel(ctx, &format!("tracing:{}:error", base)).unwrap_or_else(|e| e);
+        let async_start =
+            diag_ensure_channel(ctx, &format!("tracing:{}:asyncStart", base)).unwrap_or_else(|e| e);
+        let async_end =
+            diag_ensure_channel(ctx, &format!("tracing:{}:asyncEnd", base)).unwrap_or_else(|e| e);
+        let error =
+            diag_ensure_channel(ctx, &format!("tracing:{}:error", base)).unwrap_or_else(|e| e);
         qjs::JS_SetPropertyStr(ctx, tracing, CString::new("start").unwrap().as_ptr(), start);
         qjs::JS_SetPropertyStr(ctx, tracing, CString::new("end").unwrap().as_ptr(), end);
         qjs::JS_SetPropertyStr(
@@ -3119,9 +3252,27 @@ unsafe extern "C" fn js_diag_tracing_channel(
             );
         }
     }
-    let _ = install_obj_fn(ctx, tracing, "subscribe", Some(js_diag_tracing_subscribe), 1);
-    let _ = install_obj_fn(ctx, tracing, "unsubscribe", Some(js_diag_tracing_unsubscribe), 1);
-    let _ = install_obj_fn(ctx, tracing, "traceSync", Some(js_diag_tracing_trace_sync), 4);
+    let _ = install_obj_fn(
+        ctx,
+        tracing,
+        "subscribe",
+        Some(js_diag_tracing_subscribe),
+        1,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        tracing,
+        "unsubscribe",
+        Some(js_diag_tracing_unsubscribe),
+        1,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        tracing,
+        "traceSync",
+        Some(js_diag_tracing_trace_sync),
+        4,
+    );
     qjs::JS_SetPropertyStr(
         ctx,
         tracing,
@@ -3204,7 +3355,8 @@ unsafe extern "C" fn js_dns_lookup(
     let mut forced_family: Option<i32> = None;
     if argc >= 3 && qjs::JS_IsFunction(ctx, args[2]) != 0 {
         cb_idx = 2;
-        let family_v = qjs::JS_GetPropertyStr(ctx, args[1], CString::new("family").unwrap().as_ptr());
+        let family_v =
+            qjs::JS_GetPropertyStr(ctx, args[1], CString::new("family").unwrap().as_ptr());
         if !qjs::JS_IsUndefined(family_v) {
             let mut fam: i32 = 0;
             let _ = qjs::JS_ToInt32(ctx, &mut fam, family_v);
@@ -3401,11 +3553,7 @@ unsafe fn vm_run_in_new_context_with_sandbox(
     };
 
     let global = qjs::JS_GetGlobalObject(ctx);
-    let fn_ctor = qjs::JS_GetPropertyStr(
-        ctx,
-        global,
-        CString::new("Function").unwrap().as_ptr(),
-    );
+    let fn_ctor = qjs::JS_GetPropertyStr(ctx, global, CString::new("Function").unwrap().as_ptr());
     js_free_value(ctx, global);
 
     let mut ctor_argv: Vec<qjs::JSValue> = Vec::with_capacity(keys.len() + 1);
@@ -3428,11 +3576,7 @@ unsafe fn vm_run_in_new_context_with_sandbox(
                 );
             }
         };
-        ctor_argv.push(qjs::JS_NewStringLen(
-            ctx,
-            ck.as_ptr(),
-            ck.as_bytes().len(),
-        ));
+        ctor_argv.push(qjs::JS_NewStringLen(ctx, ck.as_ptr(), ck.as_bytes().len()));
     }
     ctor_argv.push(qjs::JS_NewStringLen(
         ctx,
@@ -3513,11 +3657,8 @@ unsafe extern "C" fn js_string_decoder_write(
         let args = std::slice::from_raw_parts(argv, argc as usize);
         js_string_to_owned(ctx, args[0])
     };
-    let carry_js = qjs::JS_GetPropertyStr(
-        ctx,
-        this,
-        CString::new("__kawkabCarry").unwrap().as_ptr(),
-    );
+    let carry_js =
+        qjs::JS_GetPropertyStr(ctx, this, CString::new("__kawkabCarry").unwrap().as_ptr());
     let carry = js_string_to_owned(ctx, carry_js);
     js_free_value(ctx, carry_js);
 
@@ -3576,8 +3717,6 @@ fn to_hex_bytes(input: &[u8]) -> String {
     }
     out
 }
-
-
 
 unsafe extern "C" fn js_worker_ctor(
     ctx: *mut qjs::JSContext,
@@ -3863,10 +4002,7 @@ unsafe extern "C" fn js_process_hrtime(
 }
 
 unsafe fn assert_type_error(ctx: *mut qjs::JSContext, msg: &str) -> qjs::JSValue {
-    qjs::JS_ThrowTypeError(
-        ctx,
-        CString::new(msg).unwrap_or_default().as_ptr(),
-    )
+    qjs::JS_ThrowTypeError(ctx, CString::new(msg).unwrap_or_default().as_ptr())
 }
 
 unsafe fn assert_optional_message(
@@ -4073,7 +4209,10 @@ unsafe fn regexp_source_flags_equal(
     Ok(ok)
 }
 
-unsafe fn js_array_length_u32(ctx: *mut qjs::JSContext, arr: qjs::JSValue) -> Result<u32, qjs::JSValue> {
+unsafe fn js_array_length_u32(
+    ctx: *mut qjs::JSContext,
+    arr: qjs::JSValue,
+) -> Result<u32, qjs::JSValue> {
     let lk = CString::new("length").unwrap();
     let lv = qjs::JS_GetPropertyStr(ctx, arr, lk.as_ptr());
     if is_exception(lv) {
@@ -4366,7 +4505,10 @@ unsafe extern "C" fn js_assert_equal(
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
     if argc < 2 {
-        return assert_type_error(ctx, "equal(actual, expected[, message]) requires two values");
+        return assert_type_error(
+            ctx,
+            "equal(actual, expected[, message]) requires two values",
+        );
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
     match assert_loose_equal_bool(ctx, args[0], args[1]) {
@@ -4418,7 +4560,10 @@ unsafe extern "C" fn js_assert_not_equal(
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
     if argc < 2 {
-        return assert_type_error(ctx, "notEqual(actual, expected[, message]) requires two values");
+        return assert_type_error(
+            ctx,
+            "notEqual(actual, expected[, message]) requires two values",
+        );
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
     match assert_loose_equal_bool(ctx, args[0], args[1]) {
@@ -4685,7 +4830,13 @@ unsafe fn install_builtin_assert(ctx: *mut qjs::JSContext) -> qjs::JSValue {
     let _ = install_obj_fn(ctx, main, "equal", Some(js_assert_equal), 3);
     let _ = install_obj_fn(ctx, main, "strictEqual", Some(js_assert_strict_equal), 3);
     let _ = install_obj_fn(ctx, main, "notEqual", Some(js_assert_not_equal), 3);
-    let _ = install_obj_fn(ctx, main, "notStrictEqual", Some(js_assert_not_strict_equal), 3);
+    let _ = install_obj_fn(
+        ctx,
+        main,
+        "notStrictEqual",
+        Some(js_assert_not_strict_equal),
+        3,
+    );
     let _ = install_obj_fn(ctx, main, "deepEqual", Some(js_assert_deep_equal), 3);
     let _ = install_obj_fn(
         ctx,
@@ -4928,13 +5079,7 @@ unsafe fn timers_promises_schedule_resolve(
     } else {
         std::thread::sleep(Duration::from_millis(ms));
         let mut args = vec![value];
-        let ret = qjs::JS_Call(
-            ctx,
-            resolve,
-            js_undefined(),
-            1,
-            args.as_mut_ptr(),
-        );
+        let ret = qjs::JS_Call(ctx, resolve, js_undefined(), 1, args.as_mut_ptr());
         js_free_value(ctx, resolve);
         let v = args.pop().unwrap();
         js_free_value(ctx, v);
@@ -5131,7 +5276,8 @@ unsafe fn new_js_error(ctx: *mut qjs::JSContext, msg: &str) -> qjs::JSValue {
 pub(crate) unsafe fn host_register_promise_callback(id: u64, cb: qjs::JSValue) {
     let cb = js_dup_value(cb);
     HOST_PENDING_PROMISES.with(|m| {
-        m.borrow_mut().insert(id, HostPendingPromise::Callback { cb });
+        m.borrow_mut()
+            .insert(id, HostPendingPromise::Callback { cb });
     });
 }
 
@@ -5139,7 +5285,8 @@ unsafe fn host_register_capability(id: u64, resolve: qjs::JSValue, reject: qjs::
     let resolve = js_dup_value(resolve);
     let reject = js_dup_value(reject);
     HOST_PENDING_PROMISES.with(|m| {
-        m.borrow_mut().insert(id, HostPendingPromise::Capability { resolve, reject });
+        m.borrow_mut()
+            .insert(id, HostPendingPromise::Capability { resolve, reject });
     });
 }
 
@@ -5469,7 +5616,10 @@ unsafe extern "C" fn js_fs_promises_write_file(
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
     if argc < 2 {
-        return crate::ffi::throw_type_error(ctx, "fs.promises.writeFile(path, data) requires path and data");
+        return crate::ffi::throw_type_error(
+            ctx,
+            "fs.promises.writeFile(path, data) requires path and data",
+        );
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
     let path = js_string_to_owned(ctx, args[0]);
@@ -5709,10 +5859,8 @@ unsafe extern "C" fn js_zlib_gzip_sync(
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
     let input = buffer::buffer_bytes_from_value(ctx, args[0]);
-    let mut enc = flate2::read::GzEncoder::new(
-        std::io::Cursor::new(input),
-        flate2::Compression::default(),
-    );
+    let mut enc =
+        flate2::read::GzEncoder::new(std::io::Cursor::new(input), flate2::Compression::default());
     let mut out = Vec::new();
     if let Err(e) = enc.read_to_end(&mut out) {
         return crate::ffi::throw_type_error(ctx, &format!("gzipSync: {e}"));
@@ -6401,7 +6549,6 @@ unsafe extern "C" fn js_crypto_digest(
 }
 
 unsafe extern "C" fn js_require(
-
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
     argc: c_int,
@@ -6443,8 +6590,7 @@ unsafe extern "C" fn js_require(
     }
     if request == "process" {
         let global = qjs::JS_GetGlobalObject(ctx);
-        let proc =
-            qjs::JS_GetPropertyStr(ctx, global, CString::new("process").unwrap().as_ptr());
+        let proc = qjs::JS_GetPropertyStr(ctx, global, CString::new("process").unwrap().as_ptr());
         js_free_value(ctx, global);
         if qjs::JS_IsUndefined(proc) {
             js_free_value(ctx, proc);
@@ -6461,7 +6607,8 @@ unsafe extern "C" fn js_require(
     }
     if request == "buffer" {
         let global = qjs::JS_GetGlobalObject(ctx);
-        let buf_ctor = qjs::JS_GetPropertyStr(ctx, global, CString::new("Buffer").unwrap().as_ptr());
+        let buf_ctor =
+            qjs::JS_GetPropertyStr(ctx, global, CString::new("Buffer").unwrap().as_ptr());
         if !qjs::JS_IsObject(buf_ctor) {
             js_free_value(ctx, buf_ctor);
             js_free_value(ctx, global);
@@ -6533,7 +6680,13 @@ unsafe extern "C" fn js_require(
         let _ = install_obj_fn(ctx, obj, "statSync", Some(js_fs_stat_sync), 1);
         let promises = qjs::JS_NewObject(ctx);
         let _ = install_obj_fn(ctx, promises, "readFile", Some(js_fs_promises_read_file), 1);
-        let _ = install_obj_fn(ctx, promises, "writeFile", Some(js_fs_promises_write_file), 2);
+        let _ = install_obj_fn(
+            ctx,
+            promises,
+            "writeFile",
+            Some(js_fs_promises_write_file),
+            2,
+        );
         let _ = install_obj_fn(ctx, promises, "stat", Some(js_fs_promises_stat), 1);
         let _ = install_obj_fn(ctx, promises, "readdir", Some(js_fs_promises_readdir), 1);
         let _ = install_obj_fn(ctx, promises, "mkdir", Some(js_fs_promises_mkdir), 2);
@@ -6619,12 +6772,7 @@ unsafe extern "C" fn js_require(
         );
         js_free_value(ctx, g2);
         if !qjs::JS_IsUndefined(pf) && qjs::JS_IsFunction(ctx, pf) != 0 {
-            qjs::JS_SetPropertyStr(
-                ctx,
-                obj,
-                CString::new("promisify").unwrap().as_ptr(),
-                pf,
-            );
+            qjs::JS_SetPropertyStr(ctx, obj, CString::new("promisify").unwrap().as_ptr(), pf);
         } else {
             js_free_value(ctx, pf);
         }
@@ -6716,25 +6864,13 @@ unsafe extern "C" fn js_require(
     }
     if request == "dgram" {
         let obj = qjs::JS_NewObject(ctx);
-        let _ = install_obj_fn(
-            ctx,
-            obj,
-            "createSocket",
-            Some(js_dgram_create_socket),
-            2,
-        );
+        let _ = install_obj_fn(ctx, obj, "createSocket", Some(js_dgram_create_socket), 2);
         return obj;
     }
     if request == "diagnostics_channel" {
         let obj = qjs::JS_NewObject(ctx);
         let _ = install_obj_fn(ctx, obj, "channel", Some(js_diag_channel), 1);
-        let _ = install_obj_fn(
-            ctx,
-            obj,
-            "hasSubscribers",
-            Some(js_diag_has_subscribers),
-            1,
-        );
+        let _ = install_obj_fn(ctx, obj, "hasSubscribers", Some(js_diag_has_subscribers), 1);
         let _ = install_obj_fn(ctx, obj, "subscribe", Some(js_diag_subscribe), 2);
         let _ = install_obj_fn(ctx, obj, "unsubscribe", Some(js_diag_unsubscribe), 2);
         let _ = install_obj_fn(ctx, obj, "tracingChannel", Some(js_diag_tracing_channel), 1);
@@ -6774,8 +6910,20 @@ unsafe extern "C" fn js_require(
     }
     if request == "vm" {
         let obj = qjs::JS_NewObject(ctx);
-        let _ = install_obj_fn(ctx, obj, "runInThisContext", Some(js_vm_run_in_this_context), 1);
-        let _ = install_obj_fn(ctx, obj, "runInNewContext", Some(js_vm_run_in_new_context), 2);
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "runInThisContext",
+            Some(js_vm_run_in_this_context),
+            1,
+        );
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "runInNewContext",
+            Some(js_vm_run_in_new_context),
+            2,
+        );
         let _ = install_obj_fn(ctx, obj, "Script", Some(js_return_empty_object), 1);
         let _ = install_obj_fn(ctx, obj, "createContext", Some(js_return_empty_object), 1);
         let _ = install_obj_fn(ctx, obj, "isContext", Some(js_noop), 1);
@@ -6837,11 +6985,8 @@ unsafe extern "C" fn js_require(
     }
     if request == "perf_hooks" {
         let global = qjs::JS_GetGlobalObject(ctx);
-        let perf = qjs::JS_GetPropertyStr(
-            ctx,
-            global,
-            CString::new("performance").unwrap().as_ptr(),
-        );
+        let perf =
+            qjs::JS_GetPropertyStr(ctx, global, CString::new("performance").unwrap().as_ptr());
         let obj = qjs::JS_NewObject(ctx);
         qjs::JS_SetPropertyStr(
             ctx,
@@ -6946,13 +7091,25 @@ unsafe extern "C" fn js_require(
     let global = qjs::JS_GetGlobalObject(ctx);
     let module_obj = qjs::JS_NewObject(ctx);
     let exports_obj = qjs::JS_NewObject(ctx);
-    qjs::JS_SetPropertyStr(ctx, module_obj, CString::new("exports").unwrap().as_ptr(), exports_obj);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        module_obj,
+        CString::new("exports").unwrap().as_ptr(),
+        exports_obj,
+    );
 
     let require_fn = qjs::JS_GetPropertyStr(ctx, global, CString::new("require").unwrap().as_ptr());
-    let filename_val = qjs_compat::new_string_from_cstr(ctx, CString::new(resolved.clone()).unwrap().as_ptr());
-    let dir = Path::new(&resolved).parent().unwrap_or(Path::new(".")).to_string_lossy().to_string();
-    let dirname_val =
-        qjs_compat::new_string_from_cstr(ctx, CString::new(dir.clone()).unwrap_or_default().as_ptr());
+    let filename_val =
+        qjs_compat::new_string_from_cstr(ctx, CString::new(resolved.clone()).unwrap().as_ptr());
+    let dir = Path::new(&resolved)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_string_lossy()
+        .to_string();
+    let dirname_val = qjs_compat::new_string_from_cstr(
+        ctx,
+        CString::new(dir.clone()).unwrap_or_default().as_ptr(),
+    );
     let previous = REQUIRE_BASE_DIR.with(|v| {
         let p = v.borrow().clone();
         *v.borrow_mut() = dir;
@@ -6963,7 +7120,13 @@ unsafe extern "C" fn js_require(
     let exports_arg = crate::ffi::js_dup_value(exports_obj);
     let module_arg = crate::ffi::js_dup_value(module_obj);
 
-    let mut args = [exports_arg, require_fn, module_arg, filename_val, dirname_val];
+    let mut args = [
+        exports_arg,
+        require_fn,
+        module_arg,
+        filename_val,
+        dirname_val,
+    ];
     let ret = qjs::JS_Call(ctx, func_val, global, 5, args.as_mut_ptr());
 
     crate::ffi::js_free_value(ctx, func_val);
@@ -6979,7 +7142,7 @@ unsafe extern "C" fn js_require(
         return ret;
     }
     crate::ffi::js_free_value(ctx, ret);
-    
+
     let out = qjs::JS_GetPropertyStr(ctx, module_obj, CString::new("exports").unwrap().as_ptr());
     crate::ffi::js_free_value(ctx, module_obj);
     out
@@ -8269,7 +8432,8 @@ pub unsafe fn dispatch_dgram_message(
     let buffer_ctor = qjs::JS_GetPropertyStr(ctx, global, CString::new("Buffer").unwrap().as_ptr());
     let mut msg = payload_val;
     if qjs::JS_IsObject(buffer_ctor) {
-        let from_fn = qjs::JS_GetPropertyStr(ctx, buffer_ctor, CString::new("from").unwrap().as_ptr());
+        let from_fn =
+            qjs::JS_GetPropertyStr(ctx, buffer_ctor, CString::new("from").unwrap().as_ptr());
         if qjs::JS_IsFunction(ctx, from_fn) != 0 {
             let mut argv = [js_dup_value(payload_val)];
             let out = qjs::JS_Call(ctx, from_fn, buffer_ctor, 1, argv.as_mut_ptr());
@@ -8400,7 +8564,12 @@ unsafe fn js_http_res_is_ended(ctx: *mut qjs::JSContext, this: qjs::JSValue) -> 
     b
 }
 
-unsafe fn js_worker_id(ctx: *mut qjs::JSContext, _this: qjs::JSValue, _argc: c_int, _argv: *mut qjs::JSValue) -> qjs::JSValue {
+unsafe fn js_worker_id(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
     qjs_compat::new_int(ctx, 0)
 }
 
@@ -8695,13 +8864,7 @@ unsafe fn patch_eventemitter_prototype(
             .map_err(|e| e.to_string())?
             .as_ptr(),
     );
-    install_obj_fn(
-        ctx,
-        proto,
-        "emit",
-        Some(js_eventemitter_emit_shim),
-        1,
-    )?;
+    install_obj_fn(ctx, proto, "emit", Some(js_eventemitter_emit_shim), 1)?;
     install_obj_fn(
         ctx,
         proto,
@@ -8803,11 +8966,8 @@ unsafe extern "C" fn js_eventemitter_emit_shim(
         js_free_value(ctx, oncev);
 
         if once_b && qjs::JS_IsFunction(ctx, fnv) != 0 {
-            let rm = qjs::JS_GetPropertyStr(
-                ctx,
-                this,
-                CString::new("removeListener").unwrap().as_ptr(),
-            );
+            let rm =
+                qjs::JS_GetPropertyStr(ctx, this, CString::new("removeListener").unwrap().as_ptr());
             if qjs::JS_IsFunction(ctx, rm) != 0 {
                 let mut call_argv = [js_dup_value(args[0]), js_dup_value(fnv)];
                 let cr = qjs::JS_Call(ctx, rm, this, 2, call_argv.as_mut_ptr());

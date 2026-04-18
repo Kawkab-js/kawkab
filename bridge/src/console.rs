@@ -1,7 +1,7 @@
-use core::error::JsError;
+use kawkab_core::error::JsError;
 use std::io::Write;
 
-pub fn install(isolate: &mut core::isolate::Isolate) -> Result<(), JsError> {
+pub fn install(isolate: &mut kawkab_core::isolate::Isolate) -> Result<(), JsError> {
     let ctx = isolate.ctx_ptr();
     if ctx.is_null() {
         return Err(JsError::Runtime(

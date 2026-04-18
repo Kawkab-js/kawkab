@@ -1,7 +1,10 @@
+use ring::{
+    digest, hmac,
+    rand::{SecureRandom, SystemRandom},
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use ring::{digest, hmac, rand::{SystemRandom, SecureRandom}};
 
 pub enum CryptoContext {
     Hash(digest::Context),
@@ -17,7 +20,8 @@ static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub fn random_bytes(size: usize) -> Result<Vec<u8>, String> {
     let mut buf = vec![0u8; size];
     let rng = SystemRandom::new();
-    rng.fill(&mut buf).map_err(|_| "Failed to generate random bytes".to_string())?;
+    rng.fill(&mut buf)
+        .map_err(|_| "Failed to generate random bytes".to_string())?;
     Ok(buf)
 }
 

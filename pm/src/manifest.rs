@@ -35,9 +35,10 @@ pub struct Manifest {
 impl Manifest {
     pub fn load(cwd: &Path) -> anyhow::Result<Self> {
         let file = cwd.join("package.json");
-        let raw =
-            std::fs::read_to_string(&file).with_context(|| format!("failed to read {}", file.display()))?;
-        let manifest: Manifest = serde_json::from_str(&raw).context("failed to parse package.json")?;
+        let raw = std::fs::read_to_string(&file)
+            .with_context(|| format!("failed to read {}", file.display()))?;
+        let manifest: Manifest =
+            serde_json::from_str(&raw).context("failed to parse package.json")?;
         Ok(manifest)
     }
 
@@ -52,13 +53,16 @@ impl Manifest {
     pub fn add_dependency(&mut self, name: &str, range: &str, section: DependencySection) {
         match section {
             DependencySection::Dependencies => {
-                self.dependencies.insert(name.to_string(), range.to_string());
+                self.dependencies
+                    .insert(name.to_string(), range.to_string());
             }
             DependencySection::DevDependencies => {
-                self.dev_dependencies.insert(name.to_string(), range.to_string());
+                self.dev_dependencies
+                    .insert(name.to_string(), range.to_string());
             }
             DependencySection::PeerDependencies => {
-                self.peer_dependencies.insert(name.to_string(), range.to_string());
+                self.peer_dependencies
+                    .insert(name.to_string(), range.to_string());
             }
             DependencySection::OptionalDependencies => {
                 self.optional_dependencies

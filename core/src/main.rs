@@ -8,7 +8,7 @@ use tokio::runtime;
 use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use core::{
+use kawkab_core::{
     isolate::IsolateConfig,
     scheduler::Scheduler,
 };
@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("kawkab=info,core=debug")),
+                .unwrap_or_else(|_| EnvFilter::new("kawkab=info,kawkab_core=debug")),
         )
         .with_target(true)
         .compact()
@@ -104,7 +104,7 @@ fn main() -> anyhow::Result<()> {
             sender.eval(src.as_bytes().to_vec(), "<eval>").await
         } else if let Some(path) = &cli.file {
             let src = tokio::fs::read(path).await
-                .map_err(|e| core::error::JsError::Io(e))?;
+                .map_err(|e| kawkab_core::error::JsError::Io(e))?;
             let filename = path.to_string_lossy().to_string();
             sender.eval(src, filename.as_str()).await
         } else {
@@ -125,7 +125,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn interactive_repl(sender: &core::event_loop::TaskSender) {
+async fn interactive_repl(sender: &kawkab_core::event_loop::TaskSender) {
     use std::io::{self, BufRead, Write};
 
     let stdin = io::stdin();
@@ -148,7 +148,7 @@ fn build_snapshot(
     out_path:  &PathBuf,
     cli:       &Cli,
 ) -> anyhow::Result<()> {
-    use core::isolate::{Isolate, IsolateConfig};
+    use kawkab_core::isolate::{Isolate, IsolateConfig};
     use snapshot::SnapshotBuilder;
 
     let t = Instant::now();

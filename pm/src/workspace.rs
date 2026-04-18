@@ -36,9 +36,12 @@ impl WorkspaceGraph {
                         let path = entry.path();
                         if path.join("package.json").exists() {
                             let sub = Manifest::load(&path)?;
-                            let name = sub
-                                .name
-                                .unwrap_or_else(|| path.file_name().unwrap_or_default().to_string_lossy().to_string());
+                            let name = sub.name.unwrap_or_else(|| {
+                                path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string()
+                            });
                             let version = sub.version.unwrap_or_else(|| "0.0.0".to_string());
                             graph.packages.push(WorkspacePackage {
                                 name,
@@ -52,9 +55,13 @@ impl WorkspaceGraph {
                 let exact = cwd.join(pattern);
                 if exact.join("package.json").exists() {
                     let sub = Manifest::load(&exact)?;
-                    let name = sub
-                        .name
-                        .unwrap_or_else(|| exact.file_name().unwrap_or_default().to_string_lossy().to_string());
+                    let name = sub.name.unwrap_or_else(|| {
+                        exact
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string()
+                    });
                     let version = sub.version.unwrap_or_else(|| "0.0.0".to_string());
                     graph.packages.push(WorkspacePackage {
                         name,

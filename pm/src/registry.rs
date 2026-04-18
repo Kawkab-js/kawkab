@@ -96,7 +96,12 @@ impl RegistryClient {
         &self,
         package: &str,
         version: &Version,
-    ) -> anyhow::Result<(std::collections::BTreeMap<String, String>, std::collections::BTreeMap<String, String>, String, String)> {
+    ) -> anyhow::Result<(
+        std::collections::BTreeMap<String, String>,
+        std::collections::BTreeMap<String, String>,
+        String,
+        String,
+    )> {
         let manifest = self.fetch_manifest(package)?;
         let key = version.to_string();
         let raw = manifest
@@ -113,7 +118,11 @@ impl RegistryClient {
         ))
     }
 
-    pub fn fetch_tarball(&self, package: &str, version: &Version) -> anyhow::Result<PackageTarball> {
+    pub fn fetch_tarball(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> anyhow::Result<PackageTarball> {
         let cache_hit = self.read_cached_tarball(package, version)?;
         if let Some(cached) = cache_hit {
             return Ok(cached);
@@ -141,7 +150,11 @@ impl RegistryClient {
         Ok(resolved)
     }
 
-    pub fn extract_tarball_to(&self, tarball: &PackageTarball, target: &Path) -> anyhow::Result<()> {
+    pub fn extract_tarball_to(
+        &self,
+        tarball: &PackageTarball,
+        target: &Path,
+    ) -> anyhow::Result<()> {
         fs::create_dir_all(target)?;
         let mut archive = Archive::new(GzDecoder::new(Cursor::new(&tarball.bytes)));
         for entry in archive.entries()? {
@@ -182,12 +195,17 @@ impl RegistryClient {
             .with_extension(format!("{}.tgz", version))
     }
 
-    fn read_cached_tarball(&self, package: &str, version: &Version) -> anyhow::Result<Option<PackageTarball>> {
+    fn read_cached_tarball(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> anyhow::Result<Option<PackageTarball>> {
         let file = self.cache_file(package, version);
         if !file.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(&file).with_context(|| format!("failed to read {}", file.display()))?;
+        let bytes =
+            fs::read(&file).with_context(|| format!("failed to read {}", file.display()))?;
         Ok(Some(PackageTarball {
             name: package.to_string(),
             version: version.to_string(),

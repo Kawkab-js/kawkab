@@ -18,7 +18,11 @@ impl Installer {
         }
     }
 
-    pub fn install(&self, resolved: &[ResolvedPackage], workspace: &WorkspaceGraph) -> anyhow::Result<()> {
+    pub fn install(
+        &self,
+        resolved: &[ResolvedPackage],
+        workspace: &WorkspaceGraph,
+    ) -> anyhow::Result<()> {
         let node_modules = self.cwd.join("node_modules");
         fs::create_dir_all(&node_modules)?;
         let bin_dir = node_modules.join(".bin");
@@ -55,7 +59,8 @@ impl Installer {
         }
         let raw = fs::read_to_string(&manifest_path)
             .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-        let val: serde_json::Value = serde_json::from_str(&raw).context("invalid package.json in installed package")?;
+        let val: serde_json::Value =
+            serde_json::from_str(&raw).context("invalid package.json in installed package")?;
         let Some(bin_val) = val.get("bin") else {
             return Ok(());
         };
@@ -88,7 +93,9 @@ impl Installer {
 fn create_symlink_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::symlink;
     if dst.exists() {
-        fs::remove_file(dst).or_else(|_| fs::remove_dir_all(dst)).ok();
+        fs::remove_file(dst)
+            .or_else(|_| fs::remove_dir_all(dst))
+            .ok();
     }
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
@@ -101,7 +108,9 @@ fn create_symlink_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
 fn create_symlink_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
     use std::os::windows::fs::symlink_dir;
     if dst.exists() {
-        fs::remove_dir_all(dst).or_else(|_| fs::remove_file(dst)).ok();
+        fs::remove_dir_all(dst)
+            .or_else(|_| fs::remove_file(dst))
+            .ok();
     }
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;

@@ -11,7 +11,7 @@ tokio-uring = ["io/tokio-uring"]
 name = "kawkab"
 path = "src/main.rs"
 [dependencies]
-core = { path = "../core" }
+kawkab-core = { path = "../core" }
 bridge = { path = "../bridge" }
 io = { path = "../io" }
 snapshot = { path = "../snapshot" }

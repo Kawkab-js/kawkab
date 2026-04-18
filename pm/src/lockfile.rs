@@ -37,9 +37,10 @@ impl KawkabLock {
 
     pub fn load(cwd: &Path) -> anyhow::Result<Self> {
         let file = cwd.join("kawkab.lock");
-        let raw =
-            std::fs::read_to_string(&file).with_context(|| format!("failed to read {}", file.display()))?;
-        let parsed: KawkabLock = serde_json::from_str(&raw).context("failed to parse kawkab.lock")?;
+        let raw = std::fs::read_to_string(&file)
+            .with_context(|| format!("failed to read {}", file.display()))?;
+        let parsed: KawkabLock =
+            serde_json::from_str(&raw).context("failed to parse kawkab.lock")?;
         Ok(parsed)
     }
 
