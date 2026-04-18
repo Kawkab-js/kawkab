@@ -1,0 +1,6 @@
+{
+  "name": "kawkab-kpi-http-minimal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "KPI smoke: Node http only (no npm dependencies)."
+}

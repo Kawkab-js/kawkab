@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, UdpSocket};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -7604,16 +7604,20 @@ unsafe extern "C" fn js_require(
         Some(s) => s,
         None => match std::fs::read_to_string(&resolved) {
             Ok(s) => {
-                let loaded = match crate::transpiler::transpile_ts(&s, &resolved) {
-                    Ok(js) => js,
-                    Err(e) => {
-                        return qjs::JS_ThrowTypeError(
-                            ctx,
-                            CString::new(format!("require transpile failed: {e}"))
-                                .unwrap_or_default()
-                                .as_ptr(),
-                        )
+                let loaded = if module_loader::require_should_run_transpile(&resolved) {
+                    match crate::transpiler::transpile_ts(&s, &resolved) {
+                        Ok(js) => js,
+                        Err(e) => {
+                            return qjs::JS_ThrowTypeError(
+                                ctx,
+                                CString::new(format!("require transpile failed: {e}"))
+                                    .unwrap_or_default()
+                                    .as_ptr(),
+                            )
+                        }
                     }
+                } else {
+                    s
                 };
                 MODULE_SOURCE_CACHE.with(|cache| {
                     cache.borrow_mut().insert(resolved.clone(), loaded.clone());
@@ -8925,7 +8929,7 @@ unsafe fn serve_http_request(
     Ok(())
 }
 
-pub(crate) async unsafe fn dispatch_http_connection(
+pub async unsafe fn dispatch_http_connection(
     ctx: *mut qjs::JSContext,
     server_id: u64,
     mut stream: tokio::net::TcpStream,
@@ -8987,6 +8991,7 @@ unsafe fn http_stop_listen(ctx: *mut qjs::JSContext, server: qjs::JSValue) {
     if let Some(entry) = HTTP_LISTEN_REGISTRY.with(|reg| reg.borrow_mut().remove(&id)) {
         entry.shutdown.notify_waiters();
         js_free_value(ctx, entry.server_obj);
+        PENDING_HOST_ASYNC.fetch_sub(1, Ordering::Relaxed);
     }
     qjs::JS_SetPropertyStr(
         ctx,
@@ -9369,6 +9374,166 @@ unsafe extern "C" fn js_http_res_write(
     js_dup_value(this)
 }
 
+fn http_listen_join_host_port(host: &str, port: u16) -> String {
+    let host = if host.is_empty() { "127.0.0.1" } else { host };
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+unsafe fn http_server_apply_bound_socket(ctx: *mut qjs::JSContext, server: qjs::JSValue, sa: SocketAddr) {
+    let (addr_s, fam_s, port_u) = match sa {
+        SocketAddr::V4(v4) => (v4.ip().to_string(), "IPv4", v4.port()),
+        SocketAddr::V6(v6) => (v6.ip().to_string(), "IPv6", v6.port()),
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        server,
+        CString::new("__kawkabBoundPort").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, port_u as i64),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        server,
+        CString::new("__kawkabBoundAddress").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &addr_s),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        server,
+        CString::new("__kawkabBoundFamily").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, fam_s),
+    );
+}
+
+unsafe fn http_server_clear_bound_socket(ctx: *mut qjs::JSContext, server: qjs::JSValue) {
+    qjs::JS_SetPropertyStr(
+        ctx,
+        server,
+        CString::new("__kawkabBoundPort").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, -1),
+    );
+}
+
+unsafe fn parse_http_listen_args(
+    ctx: *mut qjs::JSContext,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> (u16, String, Option<qjs::JSValue>) {
+    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
+    if args.is_empty() {
+        return (3000, "127.0.0.1".to_string(), None);
+    }
+    let mut callback_idx: Option<usize> = None;
+    for i in (0..args.len()).rev() {
+        if qjs::JS_IsFunction(ctx, args[i]) != 0 {
+            callback_idx = Some(i);
+            break;
+        }
+    }
+    let cb = callback_idx.map(|i| args[i]);
+    let mut port: u32 = 3000;
+    let mut saw_port = false;
+    let mut host: Option<String> = None;
+    for i in 0..args.len() {
+        if callback_idx == Some(i) {
+            continue;
+        }
+        let v = args[i];
+        if qjs::JS_IsFunction(ctx, v) != 0 {
+            continue;
+        }
+        if qjs::JS_IsNumber(v) {
+            let mut d: f64 = 0.0;
+            if qjs::JS_ToFloat64(ctx, &mut d as *mut f64, v) == 0
+                && d.is_finite()
+                && d >= 0.0
+                && d <= 65535.0
+            {
+                port = d as u32;
+                saw_port = true;
+                continue;
+            }
+        }
+        let s = js_string_to_owned(ctx, v);
+        if !s.is_empty() && host.is_none() {
+            host = Some(s);
+        }
+    }
+    if !saw_port && args.len() == 1 && callback_idx == Some(0) {
+        port = 0;
+    }
+    let host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+    (port as u16, host, cb)
+}
+
+unsafe extern "C" fn js_server_address(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let listen_v = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabListening").unwrap().as_ptr(),
+    );
+    let listening = qjs::JS_ToBool(ctx, listen_v) != 0;
+    js_free_value(ctx, listen_v);
+    if !listening {
+        return js_null();
+    }
+    let port_v = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabBoundPort").unwrap().as_ptr(),
+    );
+    let mut port_i: i32 = -1;
+    let _ = qjs::JS_ToInt32(ctx, &mut port_i as *mut i32, port_v);
+    js_free_value(ctx, port_v);
+    if port_i < 0 {
+        return js_null();
+    }
+    let addr_v = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabBoundAddress").unwrap().as_ptr(),
+    );
+    let fam_v = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabBoundFamily").unwrap().as_ptr(),
+    );
+    let out = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        out,
+        CString::new("port").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, port_i as i64),
+    );
+    if qjs::JS_IsString(addr_v) {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            out,
+            CString::new("address").unwrap().as_ptr(),
+            js_dup_value(addr_v),
+        );
+    }
+    if qjs::JS_IsString(fam_v) {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            out,
+            CString::new("family").unwrap().as_ptr(),
+            js_dup_value(fam_v),
+        );
+    }
+    js_free_value(ctx, addr_v);
+    js_free_value(ctx, fam_v);
+    out
+}
+
 unsafe extern "C" fn js_net_http_create_server(
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
@@ -9391,11 +9556,18 @@ unsafe extern "C" fn js_net_http_create_server(
         CString::new("__kawkabClosed").unwrap().as_ptr(),
         qjs::JS_NewBool(ctx, false),
     );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        server,
+        CString::new("__kawkabListening").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    http_server_clear_bound_socket(ctx, server);
     let listen = qjs::JS_NewCFunction2(
         ctx,
         Some(js_server_listen),
         CString::new("listen").unwrap().as_ptr(),
-        3,
+        5,
         qjs::JSCFunctionEnum_JS_CFUNC_generic,
         0,
     );
@@ -9407,6 +9579,14 @@ unsafe extern "C" fn js_net_http_create_server(
         qjs::JSCFunctionEnum_JS_CFUNC_generic,
         0,
     );
+    let address_fn = qjs::JS_NewCFunction2(
+        ctx,
+        Some(js_server_address),
+        CString::new("address").unwrap().as_ptr(),
+        0,
+        qjs::JSCFunctionEnum_JS_CFUNC_generic,
+        0,
+    );
     qjs::JS_SetPropertyStr(
         ctx,
         server,
@@ -9414,6 +9594,12 @@ unsafe extern "C" fn js_net_http_create_server(
         listen,
     );
     qjs::JS_SetPropertyStr(ctx, server, CString::new("close").unwrap().as_ptr(), close);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        server,
+        CString::new("address").unwrap().as_ptr(),
+        address_fn,
+    );
     server
 }
 
@@ -9423,24 +9609,8 @@ unsafe extern "C" fn js_server_listen(
     argc: c_int,
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
-    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
-    let mut port: i32 = 3000;
-    if let Some(v) = args.first() {
-        let _ = qjs::JS_ToInt32(ctx, &mut port as *mut i32, *v);
-    }
-    let mut on_listen: Option<qjs::JSValue> = None;
-    if let Some(v) = args.get(1) {
-        if qjs::JS_IsFunction(ctx, *v) != 0 {
-            on_listen = Some(*v);
-        }
-    }
-    if let Some(v) = args.get(2) {
-        if qjs::JS_IsFunction(ctx, *v) != 0 {
-            on_listen = Some(*v);
-        }
-    }
-
-    let addr = format!("127.0.0.1:{port}");
+    let (port, host, on_listen) = parse_http_listen_args(ctx, argc, argv);
+    let addr = http_listen_join_host_port(&host, port);
 
     let use_async = TASK_SENDER_SLOT.with(|s| s.borrow().is_some())
         && tokio::runtime::Handle::try_current().is_ok();
@@ -9452,6 +9622,17 @@ unsafe extern "C" fn js_server_listen(
                 return qjs::JS_ThrowTypeError(
                     ctx,
                     CString::new(format!("listen failed: {e}"))
+                        .unwrap_or_default()
+                        .as_ptr(),
+                )
+            }
+        };
+        let sa = match std_listener.local_addr() {
+            Ok(a) => a,
+            Err(e) => {
+                return qjs::JS_ThrowTypeError(
+                    ctx,
+                    CString::new(format!("listen local_addr failed: {e}"))
                         .unwrap_or_default()
                         .as_ptr(),
                 )
@@ -9499,6 +9680,7 @@ unsafe extern "C" fn js_server_listen(
             qjs_compat::new_int(ctx, listen_id as i64),
         );
 
+        http_server_apply_bound_socket(ctx, this, sa);
         qjs::JS_SetPropertyStr(
             ctx,
             this,
@@ -9530,6 +9712,7 @@ unsafe extern "C" fn js_server_listen(
             }
         });
 
+        PENDING_HOST_ASYNC.fetch_add(1, Ordering::Relaxed);
         return js_undefined();
     }
 
@@ -9544,6 +9727,18 @@ unsafe extern "C" fn js_server_listen(
             )
         }
     };
+    let sa = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                CString::new(format!("listen local_addr failed: {e}"))
+                    .unwrap_or_default()
+                    .as_ptr(),
+            )
+        }
+    };
+    http_server_apply_bound_socket(ctx, this, sa);
     qjs::JS_SetPropertyStr(
         ctx,
         this,
@@ -9578,6 +9773,7 @@ unsafe extern "C" fn js_server_listen(
         CString::new("__kawkabListening").unwrap().as_ptr(),
         qjs::JS_NewBool(ctx, false),
     );
+    http_server_clear_bound_socket(ctx, this);
     js_undefined()
 }
 
@@ -10210,6 +10406,7 @@ unsafe extern "C" fn js_server_close(
         CString::new("__kawkabListening").unwrap().as_ptr(),
         qjs::JS_NewBool(ctx, false),
     );
+    http_server_clear_bound_socket(ctx, this);
     qjs::JS_SetPropertyStr(
         ctx,
         this,

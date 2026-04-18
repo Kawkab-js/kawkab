@@ -1,6 +1,6 @@
 # Feature baseline
 
-This file is the **contractual baseline** for what the repository aims to ship. When behavior changes materially, update this document in the same change as the code and refresh `docs/NODE_COMPATIBILITY.md` where relevant. Status semantics: [`docs/COMPAT_DEFINITION_OF_DONE.md`](COMPAT_DEFINITION_OF_DONE.md). Product non-goals: [`docs/NODE_NON_GOALS.md`](NODE_NON_GOALS.md). Reference scenarios: [`docs/NPM_CORPUS.md`](NPM_CORPUS.md).
+This file is the **contractual baseline** for what the repository aims to ship. When behavior changes materially, update this document in the same change as the code and refresh `docs/NODE_COMPATIBILITY.md` where relevant. Status semantics: [`docs/COMPAT_DEFINITION_OF_DONE.md`](COMPAT_DEFINITION_OF_DONE.md). Product non-goals: [`docs/NODE_NON_GOALS.md`](NODE_NON_GOALS.md). **Ecosystem compatibility targets** (Express, NestJS, Prisma, Next custom server, Top 100 basket): [`docs/COMPAT_KPI.md`](COMPAT_KPI.md). Reference scenarios: [`docs/NPM_CORPUS.md`](NPM_CORPUS.md).
 
 ## Workspace layout
 
@@ -24,7 +24,7 @@ This file is the **contractual baseline** for what the repository aims to ship. 
 - **`Isolate::eval`** passes an exact byte length for the `CString` script buffer (excluding the implicit NUL) to match QuickJS `JS_Eval` expectations and avoid out-of-bounds reads.
 - Priority built-in contract: `node::compat_contract_tests::priority_builtins_green_contract` in `core/src/node/compat_contract_tests.rs` (requires network for `example.com` HTTP/HTTPS checks).
 - Repeatable checks: `cargo test --workspace --features tokio-uring` or [`scripts/compat_smoke.sh`](../scripts/compat_smoke.sh).
-- Node compatibility is **best-effort**; built-ins and globals are a curated subset — see the compatibility matrix, not npm “works everywhere”.
+- Node compatibility is **best-effort**; built-ins and globals are a curated subset — see the compatibility matrix, not npm “works everywhere”. **Directed** compatibility goals (percent targets per stack) live in [`COMPAT_KPI.md`](COMPAT_KPI.md); the frozen Top 100 package basket is [`docs/data/top100-packages.txt`](data/top100-packages.txt).
 - **Security:** `child_process` and similar host capabilities are policy-gated (e.g. `KAWKAB_ALLOW_CHILD_PROCESS`); default is restrictive.
 
 ## Package manager (CLI)
@@ -44,5 +44,6 @@ This file is the **contractual baseline** for what the repository aims to ship. 
 - **Compatibility detail:** `docs/NODE_COMPATIBILITY.md`
 - **Definition of Done (🟢/🟡):** `docs/COMPAT_DEFINITION_OF_DONE.md`
 - **Non-goals / 🔴 stance:** `docs/NODE_NON_GOALS.md`
+- **Ecosystem KPIs:** `docs/COMPAT_KPI.md`
 - **Corpus / smoke scenarios:** `docs/NPM_CORPUS.md`
 - **Release process:** `docs/RELEASE_CHECKLIST.md`

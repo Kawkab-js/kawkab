@@ -31,7 +31,7 @@ struct LoadedSource {
 }
 
 /// Version bump invalidates on-disk bytecode when cache key scheme changes.
-const TS_CACHE_SALT: &str = "kawkab-bytecode-v9";
+const TS_CACHE_SALT: &str = "kawkab-bytecode-v10";
 
 fn append_exec_fingerprint(key_material: &mut Vec<u8>, exec_src: &[u8]) {
     key_material.extend_from_slice(b":exec:");
@@ -397,13 +397,23 @@ async fn run_quickjs_inner(
         }
 
         let mut got_task = false;
+        let mut pending_http = Vec::<(u64, tokio::net::TcpStream)>::new();
         loop {
             match task_rx.try_recv() {
+                Ok(kawkab_core::event_loop::Task::HttpConnection { server_id, stream }) => {
+                    got_task = true;
+                    pending_http.push((server_id, stream));
+                }
                 Ok(task) => {
                     got_task = true;
                     handle_cli_task(ctx, task);
                 }
                 Err(_) => break,
+            }
+        }
+        for (server_id, stream) in pending_http {
+            unsafe {
+                let _ = kawkab_core::node::dispatch_http_connection(ctx, server_id, stream).await;
             }
         }
 
@@ -419,6 +429,9 @@ async fn run_quickjs_inner(
         }
 
         match task_rx.recv().await {
+            Some(kawkab_core::event_loop::Task::HttpConnection { server_id, stream }) => unsafe {
+                let _ = kawkab_core::node::dispatch_http_connection(ctx, server_id, stream).await;
+            },
             Some(task) => handle_cli_task(ctx, task),
             None => break,
         }

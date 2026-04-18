@@ -29,6 +29,7 @@ The workspace’s **primary target** is **Linux** (including **WSL2**), with **`
 Compatibility with Node is **best-effort** and **incremental**:
 
 - This repo tracks **Node.js v23-oriented naming and expectations** in [`NODE_COMPATIBILITY.md`](NODE_COMPATIBILITY.md), not a guarantee that **every** public npm package behaves identically.
+- **Ecosystem-first targets** (e.g. Express, NestJS, Prisma, Next custom server, Top 100 package basket) are defined in [`COMPAT_KPI.md`](COMPAT_KPI.md) so roadmap work optimizes for **real stacks**, not a flat “every built-in” parity score.
 - **No support** for native addons (`*.node` / N-API) unless and until explicitly documented otherwise.
 - The hardest, most time-consuming gaps are usually **deep behavioral parity**: **streams**, **backpressure**, **timers/microtasks**, and **event-loop ordering** matching ECMAScript and Node semantics.
 
@@ -52,4 +53,5 @@ Work that tends to compound value for this stack:
 
 - **Feature and platform contract:** [`FEATURE_BASELINE.md`](FEATURE_BASELINE.md)
 - **Node built-in / global matrix:** [`NODE_COMPATIBILITY.md`](NODE_COMPATIBILITY.md)
+- **Ecosystem KPIs:** [`COMPAT_KPI.md`](COMPAT_KPI.md)
 - **Release process:** [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md)

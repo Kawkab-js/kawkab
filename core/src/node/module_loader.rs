@@ -392,6 +392,18 @@ pub fn detect_source_type(path: &str, source: &str) -> SourceType {
     }
 }
 
+/// Whether `require()` should run [`crate::transpiler::transpile_ts`] before the CJS wrapper.
+///
+/// Plain `.js` / `.cjs` sources are already CommonJS; running SWC's `common_js` pass on them
+/// breaks real-world packages (for example Express `module.exports = createApplication`).
+pub fn require_should_run_transpile(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    matches!(ext, "ts" | "tsx" | "jsx")
+}
+
 /// Walk upward from `path` to find the nearest `package.json`.
 pub fn find_nearest_package_json(path: &str) -> Option<PackageJsonInfo> {
     let mut dir = PathBuf::from(path);

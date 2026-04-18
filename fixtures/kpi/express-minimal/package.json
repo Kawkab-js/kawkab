@@ -1,0 +1,9 @@
+{
+  "name": "kawkab-kpi-express-minimal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "KPI smoke: Express minimal app (run npm install in this directory).",
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
