@@ -6,9 +6,6 @@ fn main() {
         return;
     }
 
-    // When using newer QuickJS sys crates that bundle/link QuickJS themselves,
-    // compiling a second local copy causes duplicate symbols at link time.
-    // Keep local compilation opt-in for legacy setups only.
     if env::var("KAWKAB_BUILD_LOCAL_QUICKJS").ok().as_deref() != Some("1") {
         return;
     }

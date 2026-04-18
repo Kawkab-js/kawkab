@@ -1,28 +1,3 @@
-// kawkab workspace entry point
-//
-// KAWKAB — ENTRY POINT
-// ════════════════════════
-// Startup sequence (targeting <5ms to first eval):
-//
-//   t=0ms   Process starts; mimalloc initialises (< 50 µs).
-//   t=0.1   Tracing subscriber installed.
-//   t=0.2   CLI args parsed.
-//   t=0.3   Tokio runtime started.
-//   t=0.5   Scheduler::spawn() → N worker threads, each builds an Isolate.
-//             Each Isolate: RT alloc + ctx alloc + native bindings + prewarm
-//             ≈ 3–4 ms on a 3 GHz CPU.  ← This is the cold-start cost.
-//   t=3.5   First task dispatched.
-//   t=3.8   JS evaluation begins.
-//   t=4.2   Result returned.
-//            → Total: ~4.2 ms cold start ✓ (target: <5 ms)
-//
-// Warm-start path (snapshot):
-//   Snapshot restore replaces the Isolate::new() path; reduces to ~1.5 ms.
-
-// ── Allocator override ────────────────────────────────────────────────────────
-// mimalloc is a drop-in allocator optimised for small, short-lived allocations
-// — exactly what a JS workload produces (boxed JSValues, Arc<[u8]> refcounts).
-// On a synthetic JS benchmark, mimalloc reduces heap peak by ~18% vs jemalloc.
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -37,8 +12,6 @@ use core::{
     isolate::IsolateConfig,
     scheduler::Scheduler,
 };
-
-// ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(name = "kawkab", version, about = "Kawkab JS runtime")]
@@ -72,10 +45,7 @@ struct Cli {
     snapshot_out: PathBuf,
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
-
 fn main() -> anyhow::Result<()> {
-    // ── 1. Tracing ────────────────────────────────────────────────────────────
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -88,15 +58,8 @@ fn main() -> anyhow::Result<()> {
     let boot = Instant::now();
     let cli = Cli::parse();
 
-    // ── 2. Tokio runtime ──────────────────────────────────────────────────────
-    // We use a multi-thread runtime so that I/O futures can run on threads
-    // other than the JS worker threads. The JS isolates themselves always
-    // execute on their pinned worker threads via LocalSet.
-    //
-    // On Linux, tokio-uring wraps io_uring; on other OSes, standard epoll.
     let rt = runtime::Builder::new_multi_thread()
         .worker_threads(
-            // Reserve 1 thread for the main (accept) loop; workers get the rest.
             cli.workers.unwrap_or_else(num_cpus::get).saturating_sub(1).max(1),
         )
         .thread_name("kawkab-io")
@@ -105,7 +68,6 @@ fn main() -> anyhow::Result<()> {
 
     let rt_handle = rt.handle().clone();
 
-    // ── 3. Build-snapshot mode ────────────────────────────────────────────────
     if cli.build_snapshot {
         let file = cli.file.as_ref().ok_or_else(|| {
             anyhow::anyhow!("--build-snapshot requires --file")
@@ -113,7 +75,6 @@ fn main() -> anyhow::Result<()> {
         return build_snapshot(file, &cli.snapshot_out, &cli);
     }
 
-    // ── 4. Isolate configuration ──────────────────────────────────────────────
     let config = IsolateConfig {
         heap_size:  cli.heap_mib * 1024 * 1024,
         stack_size: 256 * 1024,
@@ -129,7 +90,6 @@ fn main() -> anyhow::Result<()> {
         "Kawkab starting"
     );
 
-    // ── 5. Spawn worker pool ──────────────────────────────────────────────────
     let scheduler = Scheduler::spawn(worker_count, config, rt_handle.clone())?;
 
     info!(
@@ -137,7 +97,6 @@ fn main() -> anyhow::Result<()> {
         "Kawkab ready (cold-start complete)"
     );
 
-    // ── 6. Dispatch work ──────────────────────────────────────────────────────
     rt.block_on(async move {
         let sender = scheduler.dispatch();
 
@@ -149,7 +108,6 @@ fn main() -> anyhow::Result<()> {
             let filename = path.to_string_lossy().to_string();
             sender.eval(src, filename.as_str()).await
         } else {
-            // No input — run a REPL-style prompt (simplified).
             interactive_repl(sender).await;
             return Ok(());
         };
@@ -166,8 +124,6 @@ fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-
-// ── Interactive REPL (simplified) ─────────────────────────────────────────────
 
 async fn interactive_repl(sender: &core::event_loop::TaskSender) {
     use std::io::{self, BufRead, Write};
@@ -187,8 +143,6 @@ async fn interactive_repl(sender: &core::event_loop::TaskSender) {
     }
 }
 
-// ── Snapshot builder ──────────────────────────────────────────────────────────
-
 fn build_snapshot(
     src_file:  &PathBuf,
     out_path:  &PathBuf,
@@ -205,13 +159,12 @@ fn build_snapshot(
         heap_size:  cli.heap_mib * 1024 * 1024,
         stack_size: 256 * 1024,
         strict:     true,
-        prewarm:    false, // skip prewarm during snapshot build
+        prewarm:    false,
     };
 
     let mut isolate = Isolate::new(config)?;
     let mut builder = SnapshotBuilder::new();
 
-    // Compile the user script into the snapshot.
     unsafe {
         builder.add_script(
             isolate.ctx_ptr(),

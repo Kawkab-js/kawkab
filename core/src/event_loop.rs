@@ -1,5 +1,3 @@
-// QuickJS microtasks + Tokio: drain tasks, flush `run_pending_jobs`, then await the channel.
-
 use std::{sync::Arc, time::Duration};
 
 use quickjs_sys as qjs;
@@ -12,65 +10,62 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{error::JsError, isolate::Isolate, qjs_compat};
 
-/// A task sent from the host (or another isolate) into this EventLoop.
+/// Host/worker task delivered to the isolate loop.
 pub enum Task {
-    /// Evaluate a JS source snippet.
+    /// Eval JS source.
     Eval {
         src: Arc<[u8]>,
         filename: Arc<str>,
         reply: oneshot::Sender<Result<String, JsError>>,
     },
-    /// Execute cached bytecode by key.
+    /// Execute cached bytecode key.
     ExecBytecode {
         key: Arc<str>,
         reply: oneshot::Sender<Result<String, JsError>>,
     },
-    /// Resolve a pending JS Promise (used by I/O completion callbacks).
+    /// Resolve pending Promise with bytes.
     ResolvePromise {
         promise_id: u64,
-        payload: Arc<[u8]>, // zero-copy: raw bytes from I/O subsystem
+        payload: Arc<[u8]>,
     },
-    /// Resolve a pending Promise with `undefined` (e.g. `fs.promises.writeFile`).
+    /// Resolve pending Promise with `undefined`.
     ResolvePromiseVoid { promise_id: u64 },
-    /// Resolve with a JSON value (`fs.promises.stat` / `readdir` shapes).
+    /// Resolve pending Promise with JSON string.
     ResolvePromiseJson {
         promise_id: u64,
         json: String,
     },
-    /// Reject a pending JS Promise.
+    /// Reject pending Promise.
     RejectPromise { promise_id: u64, reason: String },
-    /// Accepted TCP connection for the HTTP shim (handled on the isolate thread).
+    /// Accepted HTTP connection to handle on isolate thread.
     HttpConnection {
         server_id: u64,
         stream: tokio::net::TcpStream,
     },
-    /// Deferred timer (`setTimeout` / `setInterval` shim) — run on the isolate thread.
+    /// Deferred timer callback on isolate thread.
     TimerCallback { timer_id: u64 },
-    /// UDP datagram for a `dgram` socket.
+    /// UDP datagram dispatch.
     UdpMessage {
         socket_id: u64,
         payload: Arc<[u8]>,
         host: Arc<str>,
         port: u16,
     },
-    /// Graceful shutdown.
+    /// Graceful shutdown signal.
     Shutdown,
 }
 
 pub struct EventLoop {
     isolate: Isolate,
     task_rx: mpsc::UnboundedReceiver<Task>,
-    /// Public handle: clone this to send tasks into the loop.
+    /// Cloneable sender into this loop.
     task_tx: mpsc::UnboundedSender<Task>,
-    /// Tokio runtime handle — reserved for spawning I/O outside the loop.
+    /// Tokio runtime handle for out-of-loop I/O.
     _rt_handle: Handle,
 }
 
 impl EventLoop {
-    /// Construct an EventLoop around an already-initialised Isolate.
-    ///
-    /// `rt_handle` must be a Tokio multi-thread runtime handle so that I/O
-    /// futures can be spawned onto other threads while JS stays pinned here.
+    /// Build loop around an initialized isolate.
     pub fn new(isolate: Isolate, rt_handle: Handle) -> Self {
         let (task_tx, task_rx) = mpsc::unbounded_channel();
         Self {
@@ -81,7 +76,7 @@ impl EventLoop {
         }
     }
 
-    /// Returns a `TaskSender` — a cheaply-cloneable handle for submitting work.
+    /// Return cloneable task sender.
     pub fn sender(&self) -> TaskSender {
         TaskSender {
             inner: self.task_tx.clone(),
@@ -92,15 +87,7 @@ impl EventLoop {
         self.isolate.ctx_ptr()
     }
 
-    /// Drive the event loop to completion.
-    ///
-    /// This is a `!Send` future; it must be `.await`ed on the thread that owns
-    /// the Isolate. Use `tokio::task::LocalSet` or a pinned task for this.
-    ///
-    /// ```ignore
-    /// let local = tokio::task::LocalSet::new();
-    /// local.run_until(event_loop.run()).await;
-    /// ```
+    /// Run until shutdown/channel close.
     #[instrument(name = "event_loop_run", skip(self))]
     pub async fn run(mut self) -> Result<(), JsError> {
         debug!("EventLoop starting");
@@ -317,12 +304,12 @@ pub struct TaskSender {
 }
 
 impl TaskSender {
-    /// Build a TaskSender directly from a channel sender (used by the CLI runner).
+    /// Wrap an existing channel sender.
     pub fn from_sender(inner: tokio::sync::mpsc::UnboundedSender<Task>) -> Self {
         Self { inner }
     }
 
-    /// Evaluate a JS string and wait for the result.
+    /// Eval JS and await result.
     pub async fn eval(
         &self,
         src: impl Into<Arc<[u8]>>,
@@ -339,7 +326,7 @@ impl TaskSender {
         rx.await.map_err(|_| JsError::ChannelClosed)?
     }
 
-    /// Execute cached bytecode and wait for the result.
+    /// Execute bytecode and await result.
     pub async fn exec_bytecode(&self, key: impl Into<Arc<str>>) -> Result<String, JsError> {
         let (reply, rx) = oneshot::channel();
         self.inner
@@ -351,9 +338,7 @@ impl TaskSender {
         rx.await.map_err(|_| JsError::ChannelClosed)?
     }
 
-    /// Resolve a pending promise from an I/O completion callback.
-    ///
-    /// `payload` is an `Arc<[u8]>` — zero-copy hand-off from the I/O layer.
+    /// Resolve pending Promise with payload.
     pub fn resolve_promise(&self, promise_id: u64, payload: Arc<[u8]>) {
         let _ = self.inner.send(Task::ResolvePromise {
             promise_id,
@@ -369,22 +354,22 @@ impl TaskSender {
         let _ = self.inner.send(Task::ResolvePromiseJson { promise_id, json });
     }
 
-    /// Reject a pending promise.
+    /// Reject pending Promise.
     pub fn reject_promise(&self, promise_id: u64, reason: String) {
         let _ = self.inner.send(Task::RejectPromise { promise_id, reason });
     }
 
-    /// Queue an accepted HTTP connection to be processed on the isolate thread.
+    /// Queue accepted HTTP connection.
     pub fn send_http_connection(&self, server_id: u64, stream: tokio::net::TcpStream) {
         let _ = self.inner.send(Task::HttpConnection { server_id, stream });
     }
 
-    /// Queue a timer tick to run the registered JS callback on the isolate thread.
+    /// Queue timer tick callback.
     pub fn send_timer_callback(&self, timer_id: u64) {
         let _ = self.inner.send(Task::TimerCallback { timer_id });
     }
 
-    /// Queue a UDP datagram to be emitted on the JS isolate thread.
+    /// Queue UDP datagram emission.
     pub fn send_udp_message(&self, socket_id: u64, payload: Arc<[u8]>, host: String, port: u16) {
         let _ = self.inner.send(Task::UdpMessage {
             socket_id,
@@ -394,7 +379,7 @@ impl TaskSender {
         });
     }
 
-    /// Initiate graceful shutdown.
+    /// Send shutdown task.
     pub fn shutdown(&self) {
         let _ = self.inner.send(Task::Shutdown);
     }

@@ -1,4 +1,4 @@
-//! On-disk JS bytecode cache: key = BLAKE3(canonical path || source). `.lbc` = magic + hash + `JS_WriteObject` bytes.
+//! On-disk JS bytecode cache: BLAKE3(path+source), `.lbc` = magic + hash + `JS_WriteObject`.
 
 use std::{
     fs,
@@ -61,22 +61,20 @@ pub fn compile(ctx: *mut qjs::JSContext, src: &[u8], filename: &str) -> Result<A
         ));
     }
 
-    // SAFETY: buf is a valid qjs-allocated block of `out_size` bytes.
+    // SAFETY: `buf`/`out_size` from `JS_WriteObject`; borrow then `js_free` the qjs allocation.
     let slice = unsafe { std::slice::from_raw_parts(buf, out_size) };
     let bc: Arc<[u8]> = Arc::from(slice);
 
-    // QuickJS allocates with js_malloc — free with js_free.
     unsafe { qjs::js_free(ctx, buf as *mut libc::c_void) };
 
     trace!(bytecode_bytes = bc.len(), "Bytecode compiled");
     Ok(bc)
 }
 
-/// Execute a previously compiled bytecode blob.
+/// Run bytecode from [`compile`] on this `ctx` (same QuickJS build).
 ///
 /// # Safety
-/// `ctx` must be a valid, live JSContext on the calling thread.
-/// `bc` must be a blob produced by `compile()` from the same QuickJS version.
+/// Live `ctx` on this thread; `bc` from [`compile`] for this runtime.
 pub unsafe fn exec(ctx: *mut qjs::JSContext, bc: &[u8]) -> Result<qjs::JSValue, JsError> {
     let func_val =
         unsafe { qjs::JS_ReadObject(ctx, bc.as_ptr(), bc.len(), qjs::JS_READ_OBJ_BYTECODE as i32) };

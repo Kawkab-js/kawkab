@@ -421,7 +421,7 @@ async fn run_quickjs_inner(
     Ok(())
 }
 
-/// Dispatch a single task synchronously on the QuickJS context (CLI path).
+/// CLI path: run one event-loop task on the QuickJS context.
 fn handle_cli_task(ctx: *mut qjs::JSContext, task: core::event_loop::Task) {
     use core::event_loop::Task;
     match task {
@@ -445,9 +445,7 @@ fn handle_cli_task(ctx: *mut qjs::JSContext, task: core::event_loop::Task) {
 }
 
 
-/// QuickJS bytecode for a top-level script closes over a different `global` binding than
-/// `globalThis`; `Buffer` is installed on `globalThis` during `install_runtime`. Ensure CJS
-/// entries compiled via `JS_EVAL_FLAG_COMPILE_ONLY` see the same constructor.
+/// Ensure compiled CJS sees `Buffer` by seeding it from `globalThis` before bytecode compile.
 fn cjs_bytecode_source(exec_src: &[u8]) -> Vec<u8> {
     let mut out = b"var Buffer = globalThis.Buffer;\n".to_vec();
     out.extend_from_slice(exec_src);

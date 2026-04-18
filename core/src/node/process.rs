@@ -1,5 +1,4 @@
-//! `process.stdout` / `process.stderr` backed by `BufWriter` over the host streams.
-//! Other `process.*` fields are still assembled in [`super::install_runtime`].
+//! `process.stdout`/`process.stderr` over host `BufWriter`; other `process.*` from `install_runtime`.
 
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -121,7 +120,7 @@ unsafe extern "C" fn js_stderr_write_sync(
     }
 }
 
-/// `write(chunk[, encoding][, callback])` — synchronous write; optional callback invoked with no args on success.
+/// Sync `write(chunk[, encoding][, callback])`; calls callback with no args on success.
 unsafe extern "C" fn js_stdout_write(
     ctx: *mut qjs::JSContext,
     this: qjs::JSValue,

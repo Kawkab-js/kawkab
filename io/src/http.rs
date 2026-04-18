@@ -1,8 +1,4 @@
-//! Zero-copy oriented HTTP/1.1 request head parsing via `httparse`.
-//!
-//! Header names and the request line are turned into owned strings for the JS bridge.
-//! The wire buffer can be kept as `Arc<[u8]>` so the body is exposed without an extra
-//! body-sized memcpy (see `arraybuffer_from_arc_slice` in `core`).
+//! HTTP/1.1 head parsing via `httparse`; body can stay in `Arc<[u8]>` for JS handoff.
 
 use std::collections::HashMap;
 use std::io::{self, ErrorKind};
@@ -10,10 +6,10 @@ use std::sync::Arc;
 
 use httparse::{Request, Status, EMPTY_HEADER};
 
-/// Maximum header fields per request (same order of magnitude as hyper/httparse examples).
+/// Maximum headers accepted per request.
 const MAX_HEADERS: usize = 64;
 
-/// Parsed request line + headers; `header_len` is the byte offset in the wire buffer where the body starts.
+/// Parsed request line + headers; `header_len` marks body start in the source buffer.
 #[derive(Debug)]
 pub struct ParsedHead {
     pub method: String,
@@ -22,7 +18,7 @@ pub struct ParsedHead {
     pub headers: HashMap<String, String>,
 }
 
-/// Parse available bytes; returns `Ok(None)` if more data is needed.
+/// Parse available bytes; returns `Ok(None)` until headers are complete.
 pub fn parse_request_head(buf: &[u8]) -> io::Result<Option<ParsedHead>> {
     let mut storage = [EMPTY_HEADER; MAX_HEADERS];
     let mut req = Request::new(&mut storage);
@@ -64,7 +60,7 @@ pub fn content_length(headers: &HashMap<String, String>) -> usize {
         .unwrap_or(0)
 }
 
-/// Own the full read buffer so a subslice can be handed to JS as a single `Arc` backing store.
+/// Convert buffer into shared backing storage.
 #[inline]
 pub fn arc_buffer(buf: Vec<u8>) -> Arc<[u8]> {
     Arc::from(buf.into_boxed_slice())

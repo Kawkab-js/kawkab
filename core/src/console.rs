@@ -1,5 +1,3 @@
-// `console.log` / `console.error`: thread-local `BufWriter`, string args via `JS_ToCStringLen`.
-
 use std::{
     cell::RefCell,
     ffi::CString,
@@ -30,13 +28,10 @@ thread_local! {
     );
 }
 
-/// Native implementation of `console.log`.
-///
-/// Registered as a C-ABI function pointer via `JS_NewCFunction`.
+/// `console.log` QuickJS native callback.
 ///
 /// # Safety
-/// Called by the QuickJS engine on the owning thread. All pointers are valid
-/// for the duration of this call. We must not retain them.
+/// Called by QuickJS on the isolate thread; pointers valid only for this call.
 unsafe extern "C" fn native_console_log(
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
@@ -47,7 +42,7 @@ unsafe extern "C" fn native_console_log(
     js_undefined()
 }
 
-/// Native implementation of `console.error`.
+/// `console.error` QuickJS native callback.
 unsafe extern "C" fn native_console_error(
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
@@ -58,7 +53,7 @@ unsafe extern "C" fn native_console_error(
     js_undefined()
 }
 
-/// Native implementation of `console.warn` (alias of `console.error`).
+/// `console.warn` QuickJS native callback (stderr path like `console.error`).
 unsafe extern "C" fn native_console_warn(
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
@@ -69,13 +64,10 @@ unsafe extern "C" fn native_console_warn(
     js_undefined()
 }
 
-/// Write all arguments to the appropriate output stream.
-///
-/// Hot path: zero allocations for all-string arguments (the common case).
-/// For non-string args: one JS_ToString allocation per argument.
+/// Print `argc` values to stdout or stderr (strings fast-path; else `JS_ToString` per arg).
 ///
 /// # Safety
-/// `ctx` valid, `argv` points to `argc` valid JSValues.
+/// Valid `ctx` and `argv`/`argc` from QuickJS.
 unsafe fn write_console_args(
     ctx: *mut qjs::JSContext,
     argc: i32,
@@ -97,10 +89,10 @@ unsafe fn write_console_args(
     }
 }
 
-/// Inner write loop — separated so it's monomorphised once per stream type.
+/// Inner loop (monomorphised once per `W`).
 ///
 /// # Safety
-/// All pointers in `args` are valid JSValues on the current thread.
+/// `args` are live `JSValue`s on this thread.
 unsafe fn write_args_to<W: Write>(ctx: *mut qjs::JSContext, args: &[qjs::JSValue], out: &mut W) {
     for (i, &arg) in args.iter().enumerate() {
         if i > 0 {
@@ -131,15 +123,12 @@ unsafe fn write_args_to<W: Write>(ctx: *mut qjs::JSContext, args: &[qjs::JSValue
     let _ = out.flush();
 }
 
-/// Install `console.{log,error,warn,info,debug}` on the global object.
-///
-/// Call this once during Isolate construction.
+/// Install `console.{log,error,warn,info,debug}` on `globalThis`.
 ///
 /// # Safety
-/// Must be called on the thread that owns `isolate`.
+/// Call on the thread that owns `isolate`.
 pub fn install(isolate: &mut crate::isolate::Isolate) -> Result<(), JsError> {
-    // SAFETY: We have exclusive mutable access to the isolate (guaranteed by
-    // &mut Isolate), so no other code can be executing JS right now.
+    // SAFETY: `&mut Isolate` — no concurrent JS on this thread.
     unsafe {
         let ctx = isolate.ctx_ptr();
 
@@ -169,7 +158,7 @@ pub fn install(isolate: &mut crate::isolate::Isolate) -> Result<(), JsError> {
     Ok(())
 }
 
-/// Flush both stdout and stderr buffers. Call at isolate teardown.
+/// Flush thread-local stdout/stderr `BufWriter`s.
 pub fn flush_all() {
     STDOUT.with(|w| {
         let _ = w.borrow_mut().flush();

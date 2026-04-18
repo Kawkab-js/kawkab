@@ -27,8 +27,7 @@ pub struct Isolate {
     ctx: *mut qjs::JSContext,
 }
 
-// SAFETY: QuickJS Runtime/Context can be Send/Sync if we ensure single-threaded access.
-// The Scheduler pins each Isolate to a single thread, so this is safe.
+// SAFETY: scheduler pins each `Isolate` to one thread, so `Send`/`Sync` follow that contract.
 unsafe impl Send for Isolate {}
 unsafe impl Sync for Isolate {}
 
@@ -53,12 +52,6 @@ impl Isolate {
 
             qjs_compat::set_max_stack_size(ctx, config.stack_size);
 
-            // Install default console if prewarm is true
-            if config.prewarm {
-                // We'll let the scheduler handle specialized bindings,
-                // but we initialize the basic context here.
-            }
-
             Ok(Self { rt, ctx })
         }
     }
@@ -72,9 +65,6 @@ impl Isolate {
             .map_err(|_| JsError::Runtime("Invalid filename".to_string()))?;
         let flags = qjs::JS_EVAL_TYPE_GLOBAL as i32;
 
-        // Ensure the source is null-terminated or use the length-based Eval.
-        // JS_Eval takes a length, so null-termination is not strictly required by the API,
-        // but it's good practice.
         unsafe {
             let val = qjs_compat::eval(
                 self.ctx,
@@ -86,7 +76,7 @@ impl Isolate {
 
             if self.is_exception(val) {
                 let _exc = qjs::JS_GetException(self.ctx);
-                qjs::__JS_FreeValue(self.ctx, val); // Free the exception tag
+                qjs::__JS_FreeValue(self.ctx, val);
                 return Err(JsError::Js("Execution failed".to_string()));
             }
 
@@ -114,17 +104,14 @@ impl Isolate {
         }
     }
 
-    /// Reserved for bytecode cache integration; not wired yet.
+    /// Stub: on-disk bytecode path not wired in this build.
     pub fn eval_bytecode(&mut self, _key: &str) -> Result<qjs::JSValue, JsError> {
         Err(JsError::Runtime(
             "eval_bytecode is not implemented for this build".to_string(),
         ))
     }
 
-    /// Runs `http.createServer` listener: `handler.call(this_val, req, res)`.
-    ///
-    /// Does not take ownership of `handler`, `req`, or `res` (caller frees). On JS
-    /// exception, returns [`JsError::Js`] with a short message.
+    /// `handler.call(this_val, req, res)` for the HTTP shim; does not consume the JS args.
     pub unsafe fn dispatch_http_request(
         &mut self,
         handler: qjs::JSValue,
@@ -142,11 +129,6 @@ impl Isolate {
 
 impl Drop for Isolate {
     fn drop(&mut self) {
-        // Native `JS_NewCFunction*` objects retain `JS_DupContext` refs. Calling
-        // `JS_FreeContext` once only decrements and returns early while those
-        // functions are reachable, and `JS_FreeRuntime` then aborts when `gc_obj_list`
-        // is non-empty. A correct refcount-ordered teardown belongs in a dedicated
-        // shutdown path; short-lived CLI runs rely on process exit to reclaim memory.
         let _ = (self.rt, self.ctx);
     }
 }

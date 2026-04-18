@@ -53,11 +53,11 @@ thread_local! {
     static TASK_SENDER_SLOT: RefCell<Option<TaskSender>> = const { RefCell::new(None) };
     static HTTP_LISTEN_REGISTRY: RefCell<HashMap<u64, HttpListenEntry>> = RefCell::new(HashMap::new());
     static TIMER_REGISTRY: RefCell<HashMap<u64, PendingTimer>> = RefCell::new(HashMap::new());
-    /// Lets `clearTimeout` / `clearInterval` cancel while a tick is running (registry entry removed).
+    /// Lets `clearTimeout`/`clearInterval` cancel during callback execution.
     static TIMER_CANCEL_BY_ID: RefCell<HashMap<u64, Arc<AtomicBool>>> = RefCell::new(HashMap::new());
-    /// When set (Tokio HTTP path), response bytes go here for ordered `write_all` on the socket task.
+    /// Tokio HTTP path: staged response bytes for ordered socket `write_all`.
     static HTTP_RESPONSE_WIRE_TX: RefCell<Option<mpsc::UnboundedSender<Vec<u8>>>> = RefCell::new(None);
-    /// Buffered `res.write` / `res.end` body bytes keyed by `__kawkabBodyAccumId` (grows in place, no per-chunk AB realloc).
+    /// Buffered `res.write`/`res.end` bytes keyed by `__kawkabBodyAccumId`.
     static HTTP_BODY_ACCUM: RefCell<HashMap<u64, Vec<u8>>> = RefCell::new(HashMap::new());
     /// Bound UDP sockets keyed by runtime socket id.
     static DGRAM_NATIVE_SOCKET_REGISTRY: RefCell<HashMap<u64, Arc<UdpSocket>>> = RefCell::new(HashMap::new());
@@ -65,7 +65,7 @@ thread_local! {
     static DGRAM_RECV_CANCEL_BY_ID: RefCell<HashMap<u64, Arc<AtomicBool>>> = RefCell::new(HashMap::new());
 }
 
-/// Restores [`REQUIRE_BASE_DIR`] after nested `require()` evaluates a module (relative resolution uses the callee `__dirname`).
+/// Restore [`REQUIRE_BASE_DIR`] after nested `require()` changes it.
 struct RequireBaseDirGuard {
     previous: String,
 }
@@ -499,7 +499,7 @@ unsafe fn eval_js_module(ctx: *mut qjs::JSContext, name: &str, src: &str) -> qjs
     )
 }
 
-/// Source for `assert.AssertionError` (eval'd once at runtime install; see `prime_assertion_error_ctor`).
+/// JS source for `assert.AssertionError` (eval once during runtime install).
 const ASSERTION_ERROR_CTOR_SRC: &str = "var AssertionError=function(o){if(!(this instanceof AssertionError))return new AssertionError(o);if(typeof o===\"string\"){Error.call(this,o);}else if(o&&typeof o===\"object\"){var m=o.message;Error.call(this,m!=null?String(m):\"\");if(\"actual\" in o)this.actual=o.actual;if(\"expected\" in o)this.expected=o.expected;if(\"operator\" in o)this.operator=o.operator;if(o.generatedMessage===false)this.generatedMessage=false;else this.generatedMessage=true;}else{Error.call(this,\"AssertionError\");}this.name=\"AssertionError\";this.code=\"ERR_ASSERTION\"};AssertionError.prototype=Object.create(Error.prototype);AssertionError.prototype.constructor=AssertionError;return AssertionError;";
 
 unsafe fn prime_assertion_error_ctor(
@@ -3333,8 +3333,7 @@ unsafe extern "C" fn js_vm_run_in_this_context(
     )
 }
 
-/// `vm.runInNewContext(code, sandbox)`: own string properties of `sandbox` become parameter names;
-/// the code is compiled as `return (<code>);` inside that function (expression-oriented, not full Node `Script` semantics).
+/// `vm.runInNewContext`: sandbox string keys become params; compile `return (<code>);`.
 unsafe fn vm_run_in_new_context_with_sandbox(
     ctx: *mut qjs::JSContext,
     code: &str,
@@ -3919,7 +3918,7 @@ unsafe fn throw_assertion_error(
     qjs::JS_Throw(ctx, err)
 }
 
-/// Uses real `==` via `globalThis.__kawkabLooseEq` (installed in `install_web_compat_globals`).
+/// Uses `globalThis.__kawkabLooseEq` for real JS `==`.
 unsafe fn assert_loose_equal_bool(
     ctx: *mut qjs::JSContext,
     a: qjs::JSValue,
@@ -4822,7 +4821,7 @@ unsafe extern "C" fn js_process_chdir(
     )
 }
 
-/// QuickJS job queue callback: `argv[0]` is the JS function, `argv[1..]` forwarded to `JS_Call`.
+/// QuickJS job callback: `argv[0]` is callee, rest forwarded to `JS_Call`.
 unsafe extern "C" fn js_enqueue_js_call_job(
     ctx: *mut qjs::JSContext,
     argc: c_int,
@@ -4882,7 +4881,7 @@ unsafe extern "C" fn js_process_next_tick(
     js_undefined()
 }
 
-/// `timers/promises`: same deferred timer path as `setTimeout`, but fulfills a Promise.
+/// `timers/promises`: deferred timer path like `setTimeout`, but resolves a Promise.
 unsafe fn timers_promises_schedule_resolve(
     ctx: *mut qjs::JSContext,
     ms: u64,
@@ -5144,7 +5143,7 @@ unsafe fn host_register_capability(id: u64, resolve: qjs::JSValue, reject: qjs::
     });
 }
 
-/// Deliver bytes to a pending promise (`fs.promises.readFile` or legacy `(err, buf)` callback).
+/// Deliver bytes to pending promise/callback (`fs.promises.readFile` or `(err, buf)`).
 pub unsafe fn host_resolve_promise(
     ctx: *mut qjs::JSContext,
     promise_id: u64,
@@ -5195,7 +5194,7 @@ pub unsafe fn host_resolve_promise(
     }
 }
 
-/// Fulfill a Capability promise with a value parsed from JSON (e.g. `fs.promises.stat`).
+/// Fulfill capability promise with JSON-parsed value (e.g. `fs.promises.stat`).
 pub unsafe fn host_resolve_promise_json(
     ctx: *mut qjs::JSContext,
     promise_id: u64,
@@ -7594,7 +7593,7 @@ unsafe fn js_resp_headers_to_lines(
     qjs::JS_FreePropertyEnum(ctx, ptab, plen);
 }
 
-/// Full HTTP/1.1 response including binary body (takes accumulated bytes from `HTTP_BODY_ACCUM`).
+/// Build full HTTP/1.1 response with binary body from `HTTP_BODY_ACCUM`.
 unsafe fn build_http_response_bytes(
     ctx: *mut qjs::JSContext,
     res: qjs::JSValue,
@@ -7686,7 +7685,7 @@ unsafe fn http_res_append_body_ab(ctx: *mut qjs::JSContext, res: qjs::JSValue, c
     });
 }
 
-/// Response status + headers for chunked encoding (no body); strips `Content-Length` / prior `Transfer-Encoding`.
+/// Build chunked response status/headers (no body), dropping old length/transfer headers.
 unsafe fn build_http_chunked_response_headers(
     ctx: *mut qjs::JSContext,
     res: qjs::JSValue,
@@ -7884,7 +7883,7 @@ async fn read_http_request_bytes_async(
     }
 }
 
-/// Invoke the Node-style `(req, res) => {}` callback; shared by the HTTP stack and [`Isolate::dispatch_http_request`].
+/// Invoke Node-style `(req, res)` handler (HTTP stack + isolate dispatch).
 pub(crate) unsafe fn http_invoke_handler(
     ctx: *mut qjs::JSContext,
     handler: qjs::JSValue,
@@ -7922,7 +7921,7 @@ unsafe fn install_event_emitter_on_http_request(ctx: *mut qjs::JSContext, req: q
     let _ = install_obj_fn(ctx, req, "emit", Some(js_events_emit), 2);
 }
 
-/// Runs the Node-style `createServer` callback and returns the raw HTTP response bytes.
+/// Run `createServer` callback and return raw HTTP response bytes.
 unsafe fn serve_http_from_parsed(
     ctx: *mut qjs::JSContext,
     server: qjs::JSValue,

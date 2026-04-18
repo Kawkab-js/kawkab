@@ -1,5 +1,4 @@
-//! Native `Buffer` helpers and bootstrap (`Uint8Array` subclass) backed by
-//! [`crate::ffi::arraybuffer_from_arc`] for zero-copy where possible.
+//! Native `Buffer` helpers/bootstrap (`Uint8Array` subclass) with zero-copy paths.
 
 use std::ffi::CString;
 use std::os::raw::c_int;
@@ -121,7 +120,7 @@ unsafe fn install_c_fn(
 /// Installs `__kawkabBuffer*` natives and runs the `Buffer` constructor bootstrap.
 ///
 /// # Safety
-/// `ctx` and `global` must be valid. On bootstrap failure this frees `global` (matching legacy behavior).
+/// `ctx`/`global` must be valid; frees `global` on bootstrap failure.
 pub unsafe fn install(ctx: *mut qjs::JSContext, global: qjs::JSValue) -> Result<(), String> {
     install_c_fn(ctx, global, "__kawkabBufferFrom", Some(js_buffer_from), 3)?;
     install_c_fn(ctx, global, "__kawkabBufferAlloc", Some(js_buffer_alloc), 3)?;
@@ -307,7 +306,7 @@ pub unsafe fn buffer_uint8_from_arc(ctx: *mut qjs::JSContext, data: Arc<[u8]>) -
     ta
 }
 
-/// Raw bytes from a JS value (string, `ArrayBuffer`, typed array, or `__kawkab_buffer_data` shim).
+/// Raw bytes from JS string/ArrayBuffer/typed-array or `__kawkab_buffer_data` shim.
 pub unsafe fn buffer_bytes_from_value(ctx: *mut qjs::JSContext, value: qjs::JSValue) -> Vec<u8> {
     if value.tag == qjs::JS_TAG_OBJECT as i64 {
         let key = CString::new("__kawkab_buffer_data").unwrap();

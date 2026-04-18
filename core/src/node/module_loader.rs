@@ -50,15 +50,12 @@ pub fn detect_source_type(path: &str, source: &str) -> SourceType {
         _ => {}
     }
 
-    // Check package.json type field
     if let Some(pkg) = find_nearest_package_json(path) {
         if pkg.module_type == SourceType::Esm {
             return SourceType::Esm;
         }
-        // explicit "commonjs" → CJS (don't check source)
     }
 
-    // Heuristic: scan source for import/export declarations
     if has_esm_syntax(source) {
         SourceType::Esm
     } else {
@@ -261,7 +258,6 @@ fn has_esm_syntax(source: &str) -> bool {
     for line in source.lines() {
         let t = line.trim_start();
         if t.starts_with("import ") || t.starts_with("import{") || t.starts_with("import(") {
-            // Skip `import(` — that's dynamic import, valid in CJS too
             if !t.starts_with("import(") {
                 return true;
             }
@@ -277,22 +273,19 @@ fn has_esm_syntax(source: &str) -> bool {
     false
 }
 
-// ── Path resolution ──────────────────────────────────────────────────────────
-
-/// Resolve a module specifier from a base directory to an absolute path (CommonJS `require` rules).
+/// Resolve module specifier to absolute path using CommonJS `require` rules.
 ///
-/// For ESM resolution (`import`), use [`resolve_module_path_with_kind`] with [`ModuleResolutionKind::Esm`].
+/// For ESM `import`, use [`resolve_module_path_with_kind`] + [`ModuleResolutionKind::Esm`].
 pub fn resolve_module_path(base: &str, request: &str) -> String {
     resolve_module_path_with_kind(base, request, ModuleResolutionKind::CommonJs)
 }
 
-/// Same as [`resolve_module_path`], but selects `require` vs `import` targets inside `package.json` `"exports"`.
+/// Like [`resolve_module_path`], but selects `require`/`import` branch from `"exports"`.
 pub fn resolve_module_path_with_kind(
     base: &str,
     request: &str,
     kind: ModuleResolutionKind,
 ) -> String {
-    // Bare specifier → node_modules lookup
     if !request.starts_with('.') && !request.starts_with('/') {
         if let Some(bare) = resolve_bare_specifier(base, request, kind) {
             return bare;
@@ -305,13 +298,11 @@ pub fn resolve_module_path_with_kind(
         Path::new(base).join(request)
     };
 
-    // Already has a known extension
     let ext = req.extension().and_then(|e| e.to_str()).unwrap_or("");
     if matches!(ext, "js" | "mjs" | "cjs" | "json" | "ts" | "tsx" | "jsx") {
         return req.to_string_lossy().to_string();
     }
 
-    // Try package.json in directory
     let pkg = req.join("package.json");
     if let Ok(raw) = std::fs::read_to_string(&pkg) {
         if let Some(main_rel) = preferred_package_entry(&raw, kind) {
@@ -319,7 +310,6 @@ pub fn resolve_module_path_with_kind(
         }
     }
 
-    // Extension probing order: .js .mjs .cjs .ts .tsx .jsx .json
     for ext in &["js", "mjs", "cjs", "ts", "tsx", "jsx", "json"] {
         let candidate = req.with_extension(ext);
         if candidate.exists() {
@@ -327,7 +317,6 @@ pub fn resolve_module_path_with_kind(
         }
     }
 
-    // Index file probing
     for idx in &[
         "index.js",
         "index.mjs",
@@ -343,7 +332,6 @@ pub fn resolve_module_path_with_kind(
         }
     }
 
-    // Fallback: return .js path (will fail at runtime with a clear error)
     req.with_extension("js").to_string_lossy().to_string()
 }
 
@@ -387,7 +375,7 @@ pub(crate) fn extract_main_from_package_json(raw: &str) -> Option<String> {
     extract_string_field(raw, "main")
 }
 
-/// Binds CommonJS `require` and `__filename` / `__dirname` / `REQUIRE_BASE_DIR` for `resolve_module_path`.
+/// Bind CommonJS `require` and path globals used by resolver.
 ///
 /// # Safety
 /// `ctx` and `global` must be valid on the installing thread.

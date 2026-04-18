@@ -50,8 +50,6 @@ fn parse_program(
     Ok((cm, program, is_ts, is_tsx, is_jsx))
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
-
 /// Strip TypeScript/JSX syntax only. **Preserves ESM `import`/`export`.**
 ///
 /// Use this for native ESM files. The output is valid ESM JavaScript that
@@ -83,7 +81,6 @@ pub fn strip_types_only(code: &str, filename: &str) -> anyhow::Result<String> {
             ));
         }
 
-        // NOTE: No CJS transform here — native ESM `import`/`export` preserved.
         Ok(to_code_default(cm.clone(), None, &program))
     })
 }

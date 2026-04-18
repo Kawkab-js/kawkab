@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
-/// Lightweight async I/O driver used by the `io` crate.
-///
-/// This keeps a stable API while the full io_uring pipeline evolves.
+/// Minimal async file driver for the `io` crate.
 pub struct UringDriver {
     root: PathBuf,
 }

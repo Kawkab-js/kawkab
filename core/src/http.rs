@@ -1,5 +1,3 @@
-// Incremental HTTP/1.1 request parsing with `httparse`; header slices borrow the read buffer.
-
 use std::{
     io::{self},
     sync::Arc,
@@ -8,21 +6,14 @@ use std::{
 use bytes::{BufMut, BytesMut};
 use httparse::{Request, Status, EMPTY_HEADER};
 
-/// Initial read buffer for incoming request headers.
-/// 8 KiB covers > 99% of real-world HTTP requests without reallocation.
+/// Default header read buffer size (8 KiB).
 const HEADER_BUF_SIZE: usize = 8 * 1024;
-/// Max headers to parse (httparse stack array — keep this small).
+/// Stack array size passed to httparse.
 const MAX_HEADERS: usize = 64;
-/// Max request line + headers size we'll accept (guards against header bombs).
+/// Max request-line + headers bytes accepted.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 
-// ── Parsed HTTP request ───────────────────────────────────────────────────────
-
-/// A zero-copy view of a parsed HTTP request.
-///
-/// All `&str` fields point into `raw_buf`, so their lifetime is tied to the
-/// buffer. In practice the event loop immediately converts needed fields to
-/// owned values before handing control to JS.
+/// Parsed request head; `&str` fields borrow the parser buffer until copied out.
 #[derive(Debug)]
 pub struct ParsedRequest<'buf> {
     pub method: &'buf str,
@@ -41,12 +32,7 @@ pub struct ParsedHeader<'buf> {
     pub value: &'buf str,
 }
 
-// ── HttpParser ────────────────────────────────────────────────────────────────
-
-/// Stateful incremental HTTP/1.1 request parser.
-///
-/// Feed bytes in via `feed()`; call `parse()` to attempt extraction once
-/// you think you have a complete header section.
+/// Incremental HTTP/1.1 request-head parser (`feed` then `parse`).
 pub struct HttpParser {
     buf: BytesMut,
     /// Bytes consumed in the last successful parse (header section length).
@@ -61,9 +47,7 @@ impl HttpParser {
         }
     }
 
-    /// Append raw bytes from the network into the internal buffer.
-    ///
-    /// No allocation if `bytes.len() <= remaining capacity`.
+    /// Append wire bytes (no alloc when capacity allows).
     #[inline]
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), io::Error> {
         if self.buf.len() + bytes.len() > MAX_HEADER_BYTES {
@@ -76,17 +60,9 @@ impl HttpParser {
         Ok(())
     }
 
-    /// Attempt to parse a complete HTTP/1.1 request header section.
-    ///
-    /// Returns `Ok(None)` if the headers are not yet complete (need more data).
-    /// Returns `Ok(Some(...))` on success.
-    /// Returns `Err` on a malformed request.
-    ///
-    /// # Zero-copy guarantee
-    /// All string slices in `ParsedRequest` point into `self.buf`. No
-    /// String allocations occur until the caller converts them.
+    /// Parse a complete header section, or `Ok(None)` if more bytes are needed.
+    /// On success, slices in `ParsedRequest` reference `self.buf` (zero-copy until owned).
     pub fn parse(&mut self) -> Result<Option<ParsedRequest<'_>>, io::Error> {
-        // Stack-allocate the header array — no heap involvement.
         let mut headers = [EMPTY_HEADER; MAX_HEADERS];
         let mut req = Request::new(&mut headers);
 
@@ -94,7 +70,6 @@ impl HttpParser {
             Ok(Status::Complete(header_len)) => {
                 self.consumed = header_len;
 
-                // Extract content-length from headers.
                 let content_length = req.headers.iter().find_map(|h| {
                     if h.name.eq_ignore_ascii_case("content-length") {
                         std::str::from_utf8(h.value)
@@ -105,7 +80,6 @@ impl HttpParser {
                     }
                 });
 
-                // Convert httparse headers to our type (all zero-copy borrows).
                 let parsed_headers: Vec<ParsedHeader<'_>> = req
                     .headers
                     .iter()
@@ -133,31 +107,26 @@ impl HttpParser {
         }
     }
 
-    /// Access the raw buffer (e.g. to read the body after headers parsed).
+    /// Full read buffer (headers + any body bytes already read).
     #[inline]
     pub fn buffer(&self) -> &[u8] {
         &self.buf
     }
 
-    /// Body bytes available in the buffer after header parsing.
+    /// Body prefix already in `buf` after `body_start`.
     #[inline]
     pub fn body_bytes(&self) -> &[u8] {
         &self.buf[self.consumed..]
     }
 
-    /// Reset for the next request (connection keep-alive).
-    ///
-    /// Retains capacity to avoid re-allocation on the next request.
+    /// Clear state for the next request on a keep-alive connection (keeps capacity).
     pub fn reset(&mut self) {
         self.buf.clear();
         self.consumed = 0;
     }
 }
 
-// ── HTTP response writer ───────────────────────────────────────────────────────
-
-/// Minimal HTTP/1.1 response builder. Writes to a `Vec<u8>` that can be sent
-/// via io_uring in a single write call.
+/// Build a raw HTTP/1.1 response in a `Vec<u8>` (single write to the socket).
 pub struct ResponseBuilder {
     buf: Vec<u8>,
 }
@@ -179,19 +148,18 @@ impl ResponseBuilder {
     }
 
     pub fn body(mut self, body: &[u8]) -> Self {
-        // Inject Content-Length automatically.
         let cl = format!("Content-Length: {}\r\n\r\n", body.len());
         self.buf.extend_from_slice(cl.as_bytes());
         self.buf.extend_from_slice(body);
         self
     }
 
-    /// Finalise and return the raw response bytes.
+    /// Consume into owned bytes.
     pub fn finish(self) -> Vec<u8> {
         self.buf
     }
 
-    /// Finalise as an `Arc<[u8]>` for zero-copy hand-off to io_uring.
+    /// Like `finish` but `Arc` for sharing with I/O.
     pub fn finish_arc(self) -> Arc<[u8]> {
         Arc::from(self.buf.as_slice())
     }
