@@ -116,6 +116,7 @@ kawkab run <script> [args...]
 kawkab outdated
 kawkab why <name> [--json] [--pretty=false] [--json-schema]
 kawkab doctor [--json] [--pretty=false]
+kawkab init [--yes|-y] [--force] [--entry <file>]
 ```
 
 Engine modes:
@@ -296,6 +297,9 @@ To reduce build output noise, use `-q` as shown above.
 - **Running from Windows PowerShell does not behave as expected:**
   - Run from WSL in the project directory.
 
+## Cursor agent transcript
+
+Related Cursor chat / agent transcript id: `06cbab36-73c3-4aa8-a9de-26f67f931f8f` (log file: `agent-transcripts/06cbab36-73c3-4aa8-a9de-26f67f931f8f.jsonl` under the Cursor project directory for this workspace).
 
 # Codetxt Command
 codetxt . --exclude-pattern "target/" --exclude-pattern "Cargo.lock" --output kawkab-project.txt

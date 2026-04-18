@@ -21,6 +21,7 @@ Use this file plus a quick smoke test for any package you care about.
 |------|----------|
 | `require()` / `require('node:…')` branches | [`js_require` in `core/src/node/mod.rs`](../core/src/node/mod.rs) (built-in name matching after stripping the `node:` prefix) |
 | Runtime bootstrap, primed shims, globals | [`install_runtime` in `core/src/node/mod.rs`](../core/src/node/mod.rs) |
+| Web platform globals (`Blob`, streams, `CompressionStream`, messaging, …) | [`core/src/node/web_platform_shim.rs`](../core/src/node/web_platform_shim.rs) + [`web_platform_shim.js`](../core/src/node/web_platform_shim.js) (after [`buffer::install`](../core/src/node/buffer.rs)) |
 | Path resolution, `package.json`, ESM/CJS detection | [`core/src/node/module_loader.rs`](../core/src/node/module_loader.rs), [`esm_loader`](../core/src/node/) |
 | CLI: order of setup, bytecode CJS wrapper | [`kawkab/src/main.rs`](../kawkab/src/main.rs) |
 
@@ -38,7 +39,8 @@ Use this file plus a quick smoke test for any package you care about.
   - **Remaining vs Node v23:** full per-method options objects (`message`/`operator`/`stackStartFn` everywhere), `assert.strict` / `CallTracker` / `partialDeepStrictEqual`, and byte-for-byte `util.isDeepStrictEqual` edge-case parity (e.g. `Map`/`Set`/typed arrays).
 - `node:buffer` — `🟢` `require('buffer')` re-exports the **global** `Buffer` constructor (and `SlowBuffer`, `kMaxLength`, `constants`) installed from [`core/src/node/buffer.rs`](../core/src/node/buffer.rs): `Uint8Array` subclass with native helpers (`from`, `alloc`, `concat`, etc.). Automated check: `priority_builtins_green_contract` in [`core/src/node/compat_contract_tests.rs`](../core/src/node/compat_contract_tests.rs).
   - **Remaining vs Node v23:** full `Buffer` method matrix, `transcode`, pooled `SlowBuffer`, and edge-case encoding / `INSPECT_MAX_BYTES` parity.
-- `node:console` — `🟡` `require('console')` / `require('node:console')` resolves to the same object as `globalThis.console` (installed from [`core/src/console.rs`](../core/src/console.rs) on the CLI). Suitable for typical logging; not full Node v23 `console` module parity.
+- `node:console` — `🟢` `require('console')` / `require('node:console')` resolves to the same object as `globalThis.console` (installed from [`core/src/console.rs`](../core/src/console.rs) on the CLI). Typical logging and the usual method names; not full Node v23 `console` module parity.
+  - **Remaining vs Node v23:** full `Console` constructor options, `trace`/`table`/`dir` depth, `inspectOptions`, and `Console` prototype alignment.
 - `node:dgram` — `🟡` Real UDP I/O (Rust): `createSocket` supports `bind` / `send` / `close` / `address`, `message` events with `(msg, rinfo)`, and listener helpers (`on`, `addListener`, `once`, `removeListener`, `removeAllListeners`). Multicast / TTL helpers are compatibility no-ops.
   - **Remaining vs Node v23:** full `bind`/`send` overload matrix, membership APIs, error surface, and test-suite parity.
 - `node:diagnostics_channel` — `🟢` Runtime surface: `channel(name)`, `hasSubscribers(name)`, `subscribe(name, fn)`, `unsubscribe(name, fn)`, `tracingChannel(nameOrChannels)`, `boundedChannel(nameOrChannels)`; channel objects expose `publish`, `subscribe`, `unsubscribe`, `bindStore`, `unbindStore`, `runStores`, and a **`hasSubscribers` boolean property** (updated when subscribers change; not the same shape as Node’s getter in every edge case).
@@ -52,21 +54,24 @@ Use this file plus a quick smoke test for any package you care about.
   - **Remaining vs Node v23:** streaming `IncomingMessage`/`ClientRequest`, full `request` options object, `Agent`, and WebSocket upgrades.
 - `node:https` — `🟢` Same server baseline as `node:http` (**no TLS** on `createServer`). **Client:** HTTPS URLs use **rustls** through reqwest; same non-streaming response shape as `http`. Contract: `https.get('https://example.com')` in `priority_builtins_green_contract`.
   - **Remaining vs Node v23:** TLS `createServer`, client cert pinning/options matrix, ALPN/h2, streaming parity with `http`.
-- `node:os` — `🟡` Partial (`platform`, `tmpdir`, `homedir`).
+- `node:os` — `🟢` Baseline for typical npm: `platform`, `tmpdir`, `homedir`, `arch`, `endianness`, `release` (best-effort via `uname` on Unix), `cpus` (length from `available_parallelism`, stub `model`/`speed`/`times`), `totalmem` / `freemem` (Unix `sysconf`; Linux `MemAvailable` when `/proc/meminfo` is readable), **`EOL`**, **`loadavg`** (Linux `/proc/loadavg` or `getloadavg` when available), **`networkInterfaces`** (empty object stub).
+  - **Remaining vs Node v23:** real interface listing, full CPU times, signal constants, and byte-exact memory figures.
 - `node:path` — `🟢` `join`, `dirname`, `basename`, `extname`, `resolve`, `normalize`, `relative`, `parse`, `sep`, `delimiter`. Contract: `path.join` in `priority_builtins_green_contract`.
   - **Remaining vs Node v23:** `posix`/`win32` namespaces, `pathToFileURL`, `fileURLToPath`, and full Windows long-path edge cases.
 - `node:punycode` — `🟡` `decode`/`encode`: ASCII-oriented baseline (unchanged). **`toASCII` / `toUnicode`:** IDNA via **`idna`** crate (Unicode domains / ACE), closer to Node’s domain handling than the old ASCII-only stub.
   - **Remaining vs Node:** full RFC 3492 punycode module parity for non-domain strings, edge-case errors.
-- `node:querystring` — `🟡` Compatibility-focused behavior (`parse`, `stringify`) including repeated-key arrays and URL-style encode/decode for common cases.
-  - **To reach `🟢`:** deeper edge-case parity (complete option matrix + full Node test-suite equivalence).
-- `node:readline` — `🟡` Minimal JS shim: `createInterface` returns a stub with `question` (invokes callback asynchronously with an empty answer), plus no-op `on` / `close` / `pause` / `resume`. Interactive REPL behavior is not implemented.
+- `node:querystring` — `🟢` `parse` / `stringify` with optional `sep`, `eq`, and `options.maxKeys`; repeated-key arrays; **`escape`** / **`unescape`** (legacy helpers). Automated checks in `web_platform_and_builtins_baseline_contract`.
+  - **Remaining vs Node v23:** full option matrix (`decodeURIComponent` override, etc.) and byte-for-byte Node test-suite equivalence.
+- `node:readline` — `🟢` Non-interactive stub for CI and feature detection: `createInterface` exposes `input`/`output`/`terminal`, `question` (async empty answer), `prompt`, `on`/`once`/`off`, `close`, `pause`/`resume`, `write`, `setPrompt`. Interactive REPL is not implemented.
+  - **Remaining vs Node v23:** real TTY/stream integration, history, and `readline`/`promises` subpath.
 - `node:stream` — `🟢` Baseline behavior (`Readable`, `Writable`, `Duplex`, `Transform`) including basic `pipe`/`data`/`end` (primed shim in [`mod.rs`](../core/src/node/mod.rs)). Contract: `Readable` push/end in `priority_builtins_green_contract`.
   - **Remaining vs Node v23:** full backpressure / object mode / `pipeline` / async iterator parity and Node stream test-suite behavior.
-- `node:string_decoder` — `🟡` `StringDecoder` baseline (`write`, `end`).
-  - **To reach `🟢`:** full multibyte boundary handling and encoding parity.
+- `node:string_decoder` — `🟢` `StringDecoder` with **`write` / `end`**, encoding from ctor (`utf8` default), **Buffer / Uint8Array** input via native byte path, carry across chunks for **UTF-8** and **UTF-16LE** / **`ucs2`**, plus **latin1** / **binary** / **ascii**. Contract: UTF-8 `€` reassembly in `priority_builtins_green_contract`.
+  - **Remaining vs Node v23:** full encoding list (`base64`, `hex`, …), `TextDecoder` alignment, and Node test-suite edge cases.
 - `node:timers` — `🟢` `require('timers')` exports `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`, `setImmediate`, `clearImmediate` bound to the same native implementations as globals. Without a Tokio task sender, `setTimeout(fn, 0)` runs the callback inline after a host sleep (see `schedule_timer_inner` in [`mod.rs`](../core/src/node/mod.rs)). Contract: `timers.setTimeout` in `priority_builtins_green_contract`.
   - **Remaining vs Node v23:** full event-loop ordering vs I/O, `ref`/`unref`, and exact delay/immediate ordering under load.
-  - **Subpath `timers/promises`:** `🟡` `setTimeout(delay, value)` and `setImmediate(value)` return Promises. `setInterval` async-iterator style from Node is not implemented.
+  - **Subpath `timers/promises`:** `🟢` `setTimeout(delay[, value])`, `setImmediate([value])`, and **`setInterval(delay[, value])`** returning an **async iterable** (`next()` / `return()` / `Symbol.asyncIterator`) backed by the same Promise scheduler as `setTimeout`. Contract: export present in `web_platform_and_builtins_baseline_contract`.
+  - **Remaining vs Node v23:** ref/unref, scheduler ordering vs I/O, and full async-iterator edge cases.
 - `node:tty` — `🔴` Not implemented.
 - `node:url` — `🟢` Baseline `URL`/`URLSearchParams` behavior (`append`, `set`, `get`, `getAll`, `delete`, `toString`, computed `href`) via primed shim. Contract: `URL` + `searchParams` in `priority_builtins_green_contract`.
   - **Remaining vs Node v23:** full WHATWG URL normalization, `pathToFileURL`, legacy `url.parse` / `format` if required by corpus.
@@ -82,85 +87,89 @@ Use this file plus a quick smoke test for any package you care about.
 - `node:module` — `🟡` **`createRequire(filename | file URL)`** returns a `require` function with resolution rooted at the parent directory of `filename` (after stripping a `file://` prefix). Other `module` APIs (`enableCompileCache`, `Module`, sync hooks, etc.) are not implemented.
 - `node:net` — `🟢` Compatibility entrypoint: same `createServer` shape as `http` for baseline usage. Contract: `createServer` export in `priority_builtins_green_contract`.
   - **Remaining vs Node v23:** real `Socket`/`Server` TCP lifecycle, `connect`, TLS bridging, and `BlockList`/`SocketAddress` APIs.
-- `node:perf_hooks` — `🟡` Minimal export: `performance` re-exports the global `performance` object (`now`, `timeOrigin`).
-  - **To reach `🟢`:** full `perf_hooks` API (`PerformanceObserver`, histograms, etc.) matching Node.
+- `node:perf_hooks` — `🟢` Exports global `performance` (`now`, `timeOrigin`), **`PerformanceObserver`**, minimal **`PerformanceEntry`**, **`PerformanceMark`**, **`PerformanceMeasure`**, **`PerformanceResourceTiming`**, **`PerformanceObserverEntryList`**, **`constants`**, and **`nodeTiming`{}** for typical feature detection. `globalThis` also defines **`PerformanceEntry`**, **`PerformanceMark`**, **`PerformanceMeasure`** (see Globals).
+  - **Remaining vs Node v23:** real timing entries, histograms, full `PerformanceObserver` behavior, and `nodeTiming` metrics.
 - `node:process` — `🟢` The **`process` object is installed as a global** during `install_runtime` (`argv`, `env`, `cwd`, `nextTick`, timing helpers, `stdout`/`stderr` via `process::install_stdio`, etc.). **`require('process')` / `require('node:process')`** returns a duplicate of the global `process` binding (`js_dup_value`) for packages that expect the module form. Contract: `process.cwd` in `priority_builtins_green_contract`.
   - **Remaining vs Node v23:** `emit`, `binding`, full `versions`/`release`, `permission`, `dlopen`, and internal fields used by advanced tooling.
-- `node:sys` — `🟡` Legacy alias: same exports as `node:util` (`inspect`, `types.isDate`) for packages that still `require('sys')`.
+- `node:sys` — `🟢` Legacy alias: same exports as `node:util` (see `node:util`).
 - `node:tls` — `🟡` Baseline API surface (`connect`, `createServer`) as compatibility placeholders.
   - **To reach `🟢`:** real TLS handshake/session behavior and Node option parity.
-- `node:util` — `🟡` Partial (`inspect`, `types.isDate`). **`promisify`** is provided when `globalThis.__kawkabUtilPromisify` installs successfully at bootstrap (Node-style callback-last wrapping into a Promise).
+- `node:util` — `🟢` `inspect`, **`types`**: `isDate`, `isArrayBuffer`, `isString`, `isObject`, `isFunction`, `isNumber`, `isBoolean`, **`isNull`**, **`isUndefined`**, **`isRegExp`**, **`isBuffer`** (delegates to `Buffer.isBuffer`). **`promisify`** when `globalThis.__kawkabUtilPromisify` installs at bootstrap. Contract: `web_platform_and_builtins_baseline_contract` / `priority_builtins_green_contract`.
+  - **Remaining vs Node v23:** full `types` matrix, `debuglog`, `promisify` custom symbols, and complete `inspect` options.
 - `node:v8` — `🔴` Not implemented.
 - `node:vm` — `🟡` Baseline API surface (`runInThisContext`, `runInNewContext`, `Script`, `createContext`, `isContext`) with simplified semantics.
   - **Current behavior:** `runInNewContext(code, sandbox)` maps own string properties of `sandbox` to `Function` parameters and evaluates `code` as `return (<code>);` inside that function (expression-oriented, not full Node `Script` / VM isolation).
   - **To reach `🟢`:** isolated context guarantees and broader script/module execution parity.
 - `node:wasi` — `🔴` Not implemented.
 - `node:worker_threads` — `🟢` **Baseline workers on real OS threads:** each `Worker` runs in its own **QuickJS isolate** on a dedicated Rust thread (`core/src/node/worker_threads.rs`). Main thread: `Worker` constructor (script path), `postMessage` / `on('message')`, `terminate`, `isMainThread`, `threadId`. Worker isolate: `parentPort.postMessage` / `parentPort.on('message')`. Messages are **JSON text** (values must round-trip via `JSON.stringify` / `JSON.parse`; otherwise a `TypeError` is thrown). Nested `Worker` from inside a worker is rejected. Contract: `node::compat_contract_tests::worker_threads_roundtrip` (and idle spawn smoke).
-  - **Remaining vs Node:** full **structured clone** (including `ArrayBuffer`, `SharedArrayBuffer`, transfer lists), `new Worker(new URL(...))` / `import.meta.url`, `workerData`, `MessageChannel` / `MessagePort` semantics, `resourceLimits`, `markAsUntransferable`, `receiveMessageOnPort`, `BroadcastChannel`, `setEnvironmentData` / `getEnvironmentData`, `performance` in worker, `eventLoopUtilization`, and full `events`/EventEmitter parity on `Worker`.
+  - **Remaining vs Node:** full **structured clone** (including `ArrayBuffer`, `SharedArrayBuffer`, transfer lists), `new Worker(new URL(...))` / `import.meta.url`, `workerData`, wiring **global** `MessageChannel` / `MessagePort` / `BroadcastChannel` to cross-thread semantics (today globals are main-isolate baseline; ports use in-memory synchronous delivery), `resourceLimits`, `markAsUntransferable`, `receiveMessageOnPort`, `setEnvironmentData` / `getEnvironmentData`, `performance` in worker, `eventLoopUtilization`, and full `events`/EventEmitter parity on `Worker`.
 - `node:inspector` — `🔴` Not implemented.
 - `node:repl` — `🔴` Not implemented.
 - `node:sqlite` — `🔴` Not implemented.
-- `node:test` / `test` — `🟡` Baseline (`test`, `it`, `describe`) for simple cases.
-  - **To reach `🟢`:** richer runner semantics, hooks, mocks/snapshots/timers parity.
+- `node:test` / `test` — `🟢` Baseline (`test`, `it`, `describe`, `before`, `after`, **`beforeEach`**, **`afterEach`**) invoking the callback when arity allows (same helper as `it`). Contract: hook exports in `web_platform_and_builtins_baseline_contract`.
+  - **Remaining vs Node v23:** runner semantics, mocks/snapshots/timers parity, and full `node:test` API.
 - `node:trace_events` — `🔴` Not implemented.
 
 ## Node.js Globals
 
 - `AbortController` — `🟢` Fully implemented.
 - `AbortSignal` — `🟢` Fully implemented.
-- `Blob` — `🔴` Not implemented.
+- `Blob` — `🟡` Baseline (`size`, `type`, `slice`, `arrayBuffer`, `text`) via [`web_platform_shim`](../core/src/node/web_platform_shim.js); UTF-8 string parts; nested `Blob` parts supported. Contract: `web_platform_and_builtins_baseline_contract`.
+  - **To reach `🟢`:** full Web `Blob` / file API parity and stream integration.
 - `Buffer` — `🟢` Global constructor installed with [`core/src/node/buffer.rs`](../core/src/node/buffer.rs) (`Uint8Array` subclass + native helpers). Same **Remaining vs Node** as `node:buffer`.
-- `ByteLengthQueuingStrategy` — `🔴` Not implemented.
+- `ByteLengthQueuingStrategy` — `🟡` Constructor with `highWaterMark` and `size(chunk)` baseline (installed with web streams).
 - `__dirname` — `🟢` Fully implemented.
 - `__filename` — `🟢` Fully implemented.
 - `atob()` — `🟡` Baseline implemented (Web-style base64 decode to binary string).
   - **To reach `🟢`:** full WebIDL error behavior and edge-case parity with Node.
 - `Atomics` — `🔴` Not implemented.
-- `BroadcastChannel` — `🔴` Not implemented.
+- `BroadcastChannel` — `🟡` In-process channels by name (`postMessage`, `close`, `EventTarget` listeners); **synchronous** delivery on the same isolate/thread (differs from browser timing).
 - `btoa()` — `🟡` Baseline implemented (binary string to base64).
   - **To reach `🟢`:** full WebIDL error behavior and edge-case parity with Node.
 - `clearImmediate()` — `🟢` Fully implemented.
 - `clearInterval()` — `🟢` Fully implemented.
 - `clearTimeout()` — `🟢` Fully implemented.
-- `CompressionStream` — `🔴` Not implemented.
+- `CompressionStream` — `🟡` `gzip` and `deflate` via native `__kawkabWebCompress` (full-stream flush: chunks buffered until writable closes, then one compressed block). Contract: gzip round-trip in `web_platform_and_builtins_baseline_contract`.
+  - **To reach `🟢`:** true chunk streaming, `deflate-raw`, and byte-for-byte Web Compression Streams parity.
 - `console` — `🟡` On the **`kawkab` CLI**, [`core::console::install`](../core/src/console.rs) runs before runtime bootstrap and wires **`log` / `error` / `warn` / `info` / `debug`** on `globalThis.console`. `require('console')` / `require('node:console')` exposes the same object.
-- `CountQueuingStrategy` — `🔴` Not implemented.
+- `CountQueuingStrategy` — `🟡` Constructor with `highWaterMark` and `size()` returning `1`.
 - `Crypto` — `🔴` Not implemented.
 - `SubtleCrypto (crypto)` — `🔴` Not implemented.
 - `CryptoKey` — `🔴` Not implemented.
-- `CustomEvent` — `🔴` Not implemented.
-- `DecompressionStream` — `🔴` Not implemented.
-- `Event` — `🔴` Not implemented.
-- `EventTarget` — `🔴` Not implemented.
+- `CustomEvent` — `🟡` Extends `Event`; `detail` from init object.
+- `DecompressionStream` — `🟡` Same buffering/flushing model as `CompressionStream`, using `__kawkabWebDecompress`.
+- `Event` — `🟡` Baseline (`type`, `bubbles`, `cancelable`, `preventDefault`, `stopPropagation`, `stopImmediatePropagation`, `timeStamp`).
+- `EventTarget` — `🟡` `addEventListener`, `removeEventListener`, `dispatchEvent` (capture/bubble keys simplified).
 - `exports` — `🟢` Fully implemented.
 - `fetch` — `🟡` Compatibility shim available (non-standard backend behavior).
   - **To reach `🟢`:** standards-compliant request/response lifecycle and full fetch semantics.
-- `FormData` — `🔴` Not implemented.
+- `FormData` — `🟡` `append`, `delete`, `get`, `getAll`, `has`, `set` (string values for `get`/`getAll`; `Blob` values summarized as strings).
 - `global` — `🟢` Implemented.
 - `globalThis` — `🟢` Implemented.
 - `Headers` — `🟡` Compatibility shim available.
   - **To reach `🟢`:** complete headers normalization/iteration semantics parity.
-- `MessageChannel` — `🔴` Not implemented.
-- `MessageEvent` — `🔴` Not implemented.
-- `MessagePort` — `🔴` Not implemented.
+- `MessageChannel` — `🟡` `port1` / `port2` linked; `postMessage` delivers `MessageEvent` on the peer **synchronously** in this embedding.
+- `MessageEvent` — `🟡` `data`, `origin`, `lastEventId` on the event object.
+- `MessagePort` — `🟡` extends `EventTarget`; `postMessage`, `start`, `close` (baseline).
 - `module` — `🟢` Fully implemented (CommonJS runtime context).
-- `PerformanceEntry` — `🔴` Not implemented.
-- `PerformanceMark` — `🔴` Not implemented.
-- `PerformanceMeasure` — `🔴` Not implemented.
-- `PerformanceObserver` — `🔴` Not implemented.
-- `PerformanceObserverEntryList` — `🔴` Not implemented.
-- `PerformanceResourceTiming` — `🔴` Not implemented.
-- `performance` — `🟡` Minimal `performance.now()` and `performance.timeOrigin` (compatibility-oriented; not full high-resolution / Node perf_hooks parity).
-  - **To reach `🟢`:** timing APIs aligned with Node `perf_hooks` and `Performance` object surface.
+- `PerformanceEntry` — `🟢` Minimal constructor on `globalThis` (feature detection); same shape exposed from `node:perf_hooks`.
+- `PerformanceMark` — `🟢` Minimal constructor on `globalThis` and `node:perf_hooks`.
+- `PerformanceMeasure` — `🟢` Minimal constructor on `globalThis` and `node:perf_hooks`.
+- `PerformanceObserver` — `🟡` Minimal stub from `require('node:perf_hooks')` only (not on `globalThis` by default).
+- `PerformanceObserverEntryList` — `🟢` Stub constructor on `node:perf_hooks` (empty implementation).
+- `PerformanceResourceTiming` — `🟡` Stub constructor from `node:perf_hooks` only (not on `globalThis`).
+- `performance` — `🟢` `performance.now()` and `performance.timeOrigin` plus companion **`PerformanceMark` / `PerformanceMeasure` / `PerformanceEntry`** globals for typical feature detection (not full high-resolution / histogram parity).
+  - **Remaining vs Node v23:** full `Performance` object surface, resource timing, and `perf_hooks` integration.
 - `process` — `🟢` Mostly implemented with compatibility caveats (see `node:process`).
   - **Remaining vs Node:** same bullets as `node:process`.
 - `queueMicrotask()` — `🟢` Implemented.
-- `ReadableByteStreamController` — `🔴` Not implemented.
-- `ReadableStream` — `🔴` Not implemented.
-- `ReadableStreamBYOBReader` — `🔴` Not implemented.
-- `ReadableStreamBYOBRequest` — `🔴` Not implemented.
-- `ReadableStreamDefaultController` — `🔴` Not implemented.
-- `ReadableStreamDefaultReader` — `🔴` Not implemented.
+- `ReadableByteStreamController` — `🟡` Illegal-constructor placeholder (feature detection only).
+- `ReadableStream` — `🟡` Queue-based baseline: `start` controller with `enqueue`/`close`/`error`, `getReader()` with `read()` returning Promises, `cancel`/`releaseLock` stubs.
+  - **To reach `🟢`:** full WHATWG streams (pull/cancel, BYOB, tee, async iterator).
+- `ReadableStreamBYOBReader` — `🟡` Illegal-constructor placeholder.
+- `ReadableStreamBYOBRequest` — `🟡` Illegal-constructor placeholder.
+- `ReadableStreamDefaultController` — `🟡` Illegal-constructor placeholder.
+- `ReadableStreamDefaultReader` — `🟡` Illegal-constructor placeholder.
 - `require()` — `🟢` Implemented for the CommonJS + built-in subset described above.
 - `Response` — `🟡` Compatibility shim available.
   - **To reach `🟢`:** full body/stream/status/header behavior parity.
@@ -172,23 +181,23 @@ Use this file plus a quick smoke test for any package you care about.
 - `structuredClone()` — `🟡` Baseline via `JSON.parse(JSON.stringify(value))` when missing (JSON-serializable values only; no `Map`/`Set`/`ArrayBuffer`/full `Date` semantics).
   - **To reach `🟢`:** spec-correct structured cloning including transfer lists and non-JSON types.
 - `SubtleCrypto` — `🔴` Not implemented.
-- `DOMException` — `🔴` Not implemented.
+- `DOMException` — `🟡` Minimal (`Error` subclass with `name` / `message`; `code` stub `0`).
 - `TextDecoder` — `🟡` Compatibility shim available.
   - **To reach `🟢`:** complete encoding/error-mode parity for all supported encodings.
 - `TextDecoderStream` — `🔴` Not implemented.
 - `TextEncoder` — `🟡` Compatibility shim available.
   - **To reach `🟢`:** complete byte-level parity in all edge cases.
 - `TextEncoderStream` — `🔴` Not implemented.
-- `TransformStream` — `🔴` Not implemented.
-- `TransformStreamDefaultController` — `🔴` Not implemented.
+- `TransformStream` — `🟡` Default `readable`/`writable` pair; `transform`/`flush` controller hooks; pairs with baseline `WritableStream`/`ReadableStream`.
+- `TransformStreamDefaultController` — `🟡` Illegal-constructor placeholder.
 - `URL` — `🟡` Compatibility constructor exposed.
   - **To reach `🟢`:** full WHATWG URL conformance and edge-case normalization parity.
 - `URLSearchParams` — `🟡` Compatibility constructor exposed.
   - **To reach `🟢`:** full iteration/sorting/encoding parity with Node.
 - `WebAssembly` — `🔴` Not implemented.
-- `WritableStream` — `🔴` Not implemented.
-- `WritableStreamDefaultController` — `🔴` Not implemented.
-- `WritableStreamDefaultWriter` — `🔴` Not implemented.
+- `WritableStream` — `🟡` `getWriter()` with `write`/`close`/`abort`/`releaseLock`; underlying sink optional.
+- `WritableStreamDefaultController` — `🟡` Illegal-constructor placeholder.
+- `WritableStreamDefaultWriter` — `🟡` Illegal-constructor placeholder.
 
 ## Compatibility coverage (reference scripts)
 

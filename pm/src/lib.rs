@@ -56,9 +56,17 @@ pub enum PmCommand {
         json: bool,
         pretty: bool,
     },
+    Init {
+        force: bool,
+        entry: String,
+    },
 }
 
 pub fn execute_command(cwd: &Path, command: PmCommand) -> anyhow::Result<()> {
+    if let PmCommand::Init { force, entry } = command {
+        return run_init(cwd, force, &entry);
+    }
+
     let mut manifest = Manifest::load(cwd).context("failed to read package.json")?;
     let workspace = WorkspaceGraph::discover(cwd, &manifest)?;
 
@@ -153,8 +161,90 @@ pub fn execute_command(cwd: &Path, command: PmCommand) -> anyhow::Result<()> {
                 );
             }
         }
+        PmCommand::Init { .. } => unreachable!("init handled above"),
     }
     Ok(())
+}
+
+fn run_init(cwd: &Path, force: bool, entry: &str) -> anyhow::Result<()> {
+    let pkg_path = cwd.join("package.json");
+    if pkg_path.exists() && !force {
+        anyhow::bail!(
+            "package.json already exists (pass --force to overwrite): {}",
+            pkg_path.display()
+        );
+    }
+
+    let entry = entry.trim();
+    if entry.is_empty() || entry.contains('/') || entry.contains('\\') {
+        anyhow::bail!("init --entry must be a single file name (e.g. index.js), got: {entry:?}");
+    }
+
+    let name = infer_package_name(cwd);
+    let mut manifest = Manifest {
+        name: Some(name.clone()),
+        version: Some("1.0.0".to_string()),
+        scripts: Default::default(),
+        workspace_patterns: Vec::new(),
+        dependencies: Default::default(),
+        dev_dependencies: Default::default(),
+        peer_dependencies: Default::default(),
+        optional_dependencies: Default::default(),
+    };
+    let start_cmd = format!("kawkab --file {entry}");
+    manifest.scripts.insert("start".to_string(), start_cmd);
+    manifest.save(cwd)?;
+
+    let entry_path = cwd.join(entry);
+    if !entry_path.exists() {
+        fs::write(
+            &entry_path,
+            "console.log(\"Hello from Kawkab\");\n",
+        )
+        .with_context(|| format!("failed to write {}", entry_path.display()))?;
+        println!("Created {}", entry_path.display());
+    }
+
+    println!("Wrote {} (package {name})", pkg_path.display());
+    println!("Run: kawkab run start   or: kawkab --file {entry}");
+    Ok(())
+}
+
+fn infer_package_name(cwd: &Path) -> String {
+    let fallback = "my-package".to_string();
+    let Some(raw) = cwd.file_name().and_then(|n| n.to_str()) else {
+        return fallback;
+    };
+    if raw.is_empty() {
+        return fallback;
+    }
+
+    let mut out = String::new();
+    for c in raw.to_lowercase().chars() {
+        match c {
+            'a'..='z' | '0'..='9' | '.' | '_' | '-' => out.push(c),
+            ' ' | '\t' => out.push('-'),
+            _ => {}
+        }
+    }
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    let out = out.trim_matches(|c| c == '-' || c == '.');
+    if out.is_empty() {
+        return fallback;
+    }
+    let mut out = out.to_string();
+    while out.starts_with('.') || out.starts_with('_') {
+        out.remove(0);
+    }
+    if out.is_empty() {
+        return fallback;
+    }
+    if out.len() > 214 {
+        out.truncate(214);
+    }
+    out
 }
 
 fn install_workspace(

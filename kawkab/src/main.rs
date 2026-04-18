@@ -142,7 +142,7 @@ where
     if raw_args.is_empty() {
         anyhow::bail!(
             "usage: kawkab --file <path-to-script.(js|jsx|ts|tsx)> [--engine auto|quickjs|node] \
-             | kawkab install|add|remove|update|run|outdated|why|doctor"
+             | kawkab install|add|remove|update|run|outdated|why|doctor|init"
         );
     }
 
@@ -257,6 +257,40 @@ fn parse_pm_command(args: &[String]) -> anyhow::Result<Option<pm::PmCommand>> {
             let json = args.iter().any(|a| a == "--json");
             let pretty = !args.iter().any(|a| a == "--pretty=false");
             Ok(Some(pm::PmCommand::Doctor { json, pretty }))
+        }
+        "init" => {
+            let mut force = false;
+            let mut entry = "index.js".to_string();
+            let mut i = 1usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--force" => {
+                        force = true;
+                        i += 1;
+                    }
+                    "-y" | "--yes" => {
+                        i += 1;
+                    }
+                    "--entry" => {
+                        let Some(v) = args.get(i + 1) else {
+                            anyhow::bail!(
+                                "usage: kawkab init [--yes|-y] [--force] [--entry <file>]"
+                            );
+                        };
+                        entry = v.clone();
+                        i += 2;
+                    }
+                    other if other.starts_with('-') => {
+                        anyhow::bail!("unknown flag for kawkab init: {other}");
+                    }
+                    _ => {
+                        anyhow::bail!(
+                            "usage: kawkab init [--yes|-y] [--force] [--entry <file>]"
+                        );
+                    }
+                }
+            }
+            Ok(Some(pm::PmCommand::Init { force, entry }))
         }
         _ => Ok(None),
     }
