@@ -436,27 +436,8 @@ async fn run_quickjs_inner(
 
 /// CLI path: run one event-loop task on the QuickJS context.
 fn handle_cli_task(ctx: *mut qjs::JSContext, task: kawkab_core::event_loop::Task) {
-    use kawkab_core::event_loop::Task;
-    match task {
-        Task::TimerCallback { timer_id } => unsafe {
-            let _ = kawkab_core::node::dispatch_timer_callback(ctx, timer_id);
-        },
-        Task::ResolvePromise {
-            promise_id,
-            payload,
-        } => unsafe {
-            let _ = kawkab_core::node::host_resolve_promise(ctx, promise_id, payload);
-        },
-        Task::ResolvePromiseVoid { promise_id } => unsafe {
-            let _ = kawkab_core::node::host_resolve_capability_void(ctx, promise_id);
-        },
-        Task::ResolvePromiseJson { promise_id, json } => unsafe {
-            let _ = kawkab_core::node::host_resolve_promise_json(ctx, promise_id, &json);
-        },
-        Task::RejectPromise { promise_id, reason } => unsafe {
-            let _ = kawkab_core::node::host_reject_promise(ctx, promise_id, &reason);
-        },
-        _ => {}
+    unsafe {
+        kawkab_core::node::dispatch_cli_isolate_task(ctx, task);
     }
 }
 

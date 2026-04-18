@@ -45,6 +45,15 @@ pub enum Task {
         host: Arc<str>,
         port: u16,
     },
+    /// `postMessage` payload from a worker isolate to the main thread (JSON text).
+    WorkerPostToMain {
+        worker_id: u64,
+        json: String,
+    },
+    /// `postMessage` payload from the main thread to a worker isolate (JSON text).
+    WorkerPostToWorker { json: String },
+    /// Ask a worker isolate loop to exit (worker thread only).
+    WorkerThreadExit,
     /// Graceful shutdown signal.
     Shutdown,
 }
@@ -275,6 +284,27 @@ impl EventLoop {
                 }
             },
 
+            Task::WorkerPostToMain { worker_id, json } => unsafe {
+                crate::node::worker_threads::dispatch_worker_post_to_main_deferred(
+                    self.isolate.ctx_ptr(),
+                    worker_id,
+                    json,
+                );
+            },
+
+            Task::WorkerPostToWorker { json } => unsafe {
+                if let Err(e) = crate::node::worker_threads::dispatch_worker_post_from_main(
+                    self.isolate.ctx_ptr(),
+                    &json,
+                ) {
+                    warn!(error = %e, "worker postMessage to worker failed");
+                }
+            },
+
+            Task::WorkerThreadExit => {
+                warn!("WorkerThreadExit received on pooled EventLoop; ignoring");
+            }
+
             Task::Shutdown => return Ok(LoopSignal::Shutdown),
         }
 
@@ -398,6 +428,20 @@ impl TaskSender {
             host: Arc::<str>::from(host),
             port,
         });
+    }
+
+    /// Queue worker `postMessage` delivery on the **main** thread isolate.
+    pub fn send_worker_post_to_main(&self, worker_id: u64, json: String) {
+        let _ = self.inner.send(Task::WorkerPostToMain { worker_id, json });
+    }
+
+    /// Queue worker `postMessage` delivery on the **current** worker isolate.
+    pub fn send_worker_post_to_worker(&self, json: String) {
+        let _ = self.inner.send(Task::WorkerPostToWorker { json });
+    }
+
+    pub fn send_worker_thread_exit(&self) {
+        let _ = self.inner.send(Task::WorkerThreadExit);
     }
 
     /// Send shutdown task.

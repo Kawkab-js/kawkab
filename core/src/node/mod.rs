@@ -30,6 +30,7 @@ mod esm_loader;
 pub mod module_loader;
 mod process;
 mod runtime_policy;
+pub mod worker_threads;
 
 #[cfg(test)]
 mod compat_contract_tests;
@@ -193,11 +194,25 @@ fn deferred_host_tasks_ready() -> bool {
     TASK_SENDER_SLOT.with(|s| s.borrow().is_some()) && Handle::try_current().is_ok()
 }
 
+pub use worker_threads::RuntimeEmbed;
+
+/// Install Node-style runtime (main thread embedding).
 pub unsafe fn install_runtime(
     ctx: *mut qjs::JSContext,
     entry_filename: &str,
     task_sender: Option<TaskSender>,
 ) -> Result<(), String> {
+    install_runtime_with_embed(ctx, entry_filename, task_sender, RuntimeEmbed::Main)
+}
+
+/// Install runtime for main or [`RuntimeEmbed::Worker`].
+pub unsafe fn install_runtime_with_embed(
+    ctx: *mut qjs::JSContext,
+    entry_filename: &str,
+    task_sender: Option<TaskSender>,
+    embed: RuntimeEmbed,
+) -> Result<(), String> {
+    worker_threads::set_runtime_embed(embed);
     TASK_SENDER_SLOT.with(|s| *s.borrow_mut() = task_sender);
     let entry_path = PathBuf::from(entry_filename);
     let base_dir = entry_path
@@ -3841,50 +3856,225 @@ fn to_hex_bytes(input: &[u8]) -> String {
     out
 }
 
+unsafe fn js_worker_read_id(ctx: *mut qjs::JSContext, this_val: qjs::JSValue) -> Result<u64, qjs::JSValue> {
+    let key = CString::new("__kawkabWorkerId").unwrap();
+    let idv = qjs::JS_GetPropertyStr(ctx, this_val, key.as_ptr());
+    if qjs::JS_IsUndefined(idv) || qjs::JS_IsNull(idv) {
+        js_free_value(ctx, idv);
+        return Err(crate::ffi::throw_type_error(ctx, "invalid Worker handle"));
+    }
+    let mut d: f64 = 0.0;
+    if qjs::JS_ToFloat64(ctx, &mut d as *mut f64, idv) != 0 {
+        js_free_value(ctx, idv);
+        return Err(crate::ffi::throw_type_error(ctx, "invalid Worker id"));
+    }
+    js_free_value(ctx, idv);
+    Ok(d as u64)
+}
+
 unsafe extern "C" fn js_worker_ctor(
     ctx: *mut qjs::JSContext,
-    _this: qjs::JSValue,
-    _argc: c_int,
-    _argv: *mut qjs::JSValue,
+    new_target: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
-    let obj = qjs::JS_NewObject(ctx);
-    let _ = install_obj_fn(ctx, obj, "on", Some(js_worker_on), 2);
-    let _ = install_obj_fn(ctx, obj, "postMessage", Some(js_worker_post_message), 1);
-    let _ = install_obj_fn(ctx, obj, "terminate", Some(js_worker_terminate), 0);
+    if !matches!(
+        worker_threads::runtime_embed(),
+        Some(RuntimeEmbed::Main)
+    ) {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("Workers can only be created from the main thread in Kawkab")
+                .unwrap()
+                .as_ptr(),
+        );
+    }
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("Worker requires a script path").unwrap().as_ptr(),
+        );
+    }
+    let proto = qjs::JS_GetPropertyStr(
+        ctx,
+        new_target,
+        CString::new("prototype").unwrap().as_ptr(),
+    );
+    if is_exception(proto) {
+        return proto;
+    }
+    let obj = if qjs::JS_IsObject(proto) {
+        let o = qjs::JS_NewObjectProto(ctx, proto);
+        js_free_value(ctx, proto);
+        if is_exception(o) {
+            return o;
+        }
+        o
+    } else {
+        js_free_value(ctx, proto);
+        qjs::JS_NewObject(ctx)
+    };
+
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let rel = js_string_to_owned(ctx, args[0]);
+    let base = REQUIRE_BASE_DIR.with(|v| v.borrow().clone());
+    let path = PathBuf::from(base).join(rel);
+    let sender = match TASK_SENDER_SLOT.with(|s| s.borrow().clone()) {
+        Some(s) => s,
+        None => {
+            js_free_value(ctx, obj);
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                CString::new("Workers require a hosted task loop (e.g. kawkab CLI)")
+                    .unwrap()
+                    .as_ptr(),
+            );
+        }
+    };
+    let wid = match worker_threads::spawn_worker_thread(sender, path) {
+        Ok(w) => w,
+        Err(e) => {
+            js_free_value(ctx, obj);
+            return crate::ffi::throw_type_error(ctx, &e);
+        }
+    };
+    let _ = install_obj_fn(ctx, obj, "on", Some(js_worker_main_on), 2);
+    let _ = install_obj_fn(
+        ctx,
+        obj,
+        "postMessage",
+        Some(js_worker_main_post_message),
+        1,
+    );
+    let _ = install_obj_fn(ctx, obj, "terminate", Some(js_worker_main_terminate), 0);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("__kawkabWorkerId").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, wid as i64),
+    );
     qjs::JS_SetPropertyStr(
         ctx,
         obj,
         CString::new("threadId").unwrap().as_ptr(),
-        qjs_compat::new_int(ctx, 0),
+        qjs_compat::new_int(ctx, wid as i64),
     );
     obj
 }
 
-unsafe extern "C" fn js_worker_on(
-    _ctx: *mut qjs::JSContext,
-    this: qjs::JSValue,
-    _argc: c_int,
-    _argv: *mut qjs::JSValue,
+unsafe extern "C" fn js_worker_main_on(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
-    this
-}
-
-unsafe extern "C" fn js_worker_post_message(
-    _ctx: *mut qjs::JSContext,
-    _this: qjs::JSValue,
-    _argc: c_int,
-    _argv: *mut qjs::JSValue,
-) -> qjs::JSValue {
+    if argc < 2 {
+        return js_undefined();
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let ev = js_string_to_owned(ctx, args[0]);
+    if ev != "message" {
+        return js_undefined();
+    }
+    let wid = match js_worker_read_id(ctx, this_val) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    worker_threads::set_main_worker_message_listener(ctx, wid, args[1]);
     js_undefined()
 }
 
-unsafe extern "C" fn js_worker_terminate(
+unsafe extern "C" fn js_worker_main_post_message(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return js_undefined();
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let wid = match js_worker_read_id(ctx, this_val) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    let json = match worker_threads::js_value_to_json_for_worker(ctx, args[0]) {
+        Ok(s) => s,
+        Err(e) => return crate::ffi::throw_type_error(ctx, &e),
+    };
+    if let Err(e) = worker_threads::worker_post_from_main_to_worker(wid, json) {
+        return crate::ffi::throw_type_error(ctx, &e);
+    }
+    js_undefined()
+}
+
+unsafe extern "C" fn js_worker_main_terminate(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let wid = match js_worker_read_id(ctx, this_val) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    worker_threads::remove_main_listener(wid, ctx);
+    worker_threads::terminate_worker_thread(wid);
+    js_undefined()
+}
+
+unsafe extern "C" fn js_worker_nested_disallowed(
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
     _argc: c_int,
     _argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
-    qjs_compat::new_int(ctx, 0)
+    qjs::JS_ThrowTypeError(
+        ctx,
+        CString::new("nested Workers are not supported in Kawkab yet")
+            .unwrap()
+            .as_ptr(),
+    )
+}
+
+unsafe extern "C" fn js_parent_port_on(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return js_undefined();
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let ev = js_string_to_owned(ctx, args[0]);
+    if ev != "message" {
+        return js_undefined();
+    }
+    worker_threads::set_worker_parent_message_listener(ctx, args[1]);
+    js_undefined()
+}
+
+unsafe extern "C" fn js_parent_port_post_message(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let worker_id = match worker_threads::runtime_embed() {
+        Some(RuntimeEmbed::Worker { worker_id, .. }) => worker_id,
+        _ => return js_undefined(),
+    };
+    if argc < 1 {
+        return js_undefined();
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let json = match worker_threads::js_value_to_json_for_worker(ctx, args[0]) {
+        Ok(s) => s,
+        Err(e) => return crate::ffi::throw_type_error(ctx, &e),
+    };
+    worker_threads::worker_post_from_worker_to_main(worker_id, json);
+    js_undefined()
 }
 
 unsafe extern "C" fn js_node_test_run(
@@ -7247,28 +7437,74 @@ unsafe extern "C" fn js_require(
     }
     if request == "worker_threads" {
         let obj = qjs::JS_NewObject(ctx);
-        let ctor = qjs::JS_NewCFunction2(
-            ctx,
-            Some(js_worker_ctor),
-            CString::new("Worker").unwrap().as_ptr(),
-            2,
-            qjs::JSCFunctionEnum_JS_CFUNC_constructor,
-            0,
-        );
-        qjs::JS_SetPropertyStr(ctx, obj, CString::new("Worker").unwrap().as_ptr(), ctor);
         let _ = install_obj_fn(ctx, obj, "MessageChannel", Some(js_return_empty_object), 0);
-        qjs::JS_SetPropertyStr(
-            ctx,
-            obj,
-            CString::new("isMainThread").unwrap().as_ptr(),
-            qjs::JS_NewBool(ctx, true),
-        );
-        qjs::JS_SetPropertyStr(
-            ctx,
-            obj,
-            CString::new("parentPort").unwrap().as_ptr(),
-            js_undefined(),
-        );
+        match worker_threads::runtime_embed() {
+            Some(RuntimeEmbed::Worker { .. }) => {
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    obj,
+                    CString::new("isMainThread").unwrap().as_ptr(),
+                    qjs::JS_NewBool(ctx, false),
+                );
+                let port = qjs::JS_NewObject(ctx);
+                let _ = install_obj_fn(ctx, port, "on", Some(js_parent_port_on), 2);
+                let _ = install_obj_fn(
+                    ctx,
+                    port,
+                    "postMessage",
+                    Some(js_parent_port_post_message),
+                    1,
+                );
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    obj,
+                    CString::new("parentPort").unwrap().as_ptr(),
+                    port,
+                );
+                let bad_ctor = qjs::JS_NewCFunction2(
+                    ctx,
+                    Some(js_worker_nested_disallowed),
+                    CString::new("Worker").unwrap().as_ptr(),
+                    1,
+                    qjs::JSCFunctionEnum_JS_CFUNC_constructor,
+                    0,
+                );
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    obj,
+                    CString::new("Worker").unwrap().as_ptr(),
+                    bad_ctor,
+                );
+            }
+            _ => {
+                let ctor = qjs::JS_NewCFunction2(
+                    ctx,
+                    Some(js_worker_ctor),
+                    CString::new("Worker").unwrap().as_ptr(),
+                    2,
+                    qjs::JSCFunctionEnum_JS_CFUNC_constructor,
+                    0,
+                );
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    obj,
+                    CString::new("Worker").unwrap().as_ptr(),
+                    ctor,
+                );
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    obj,
+                    CString::new("isMainThread").unwrap().as_ptr(),
+                    qjs::JS_NewBool(ctx, true),
+                );
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    obj,
+                    CString::new("parentPort").unwrap().as_ptr(),
+                    js_undefined(),
+                );
+            }
+        }
         return obj;
     }
     if request == "timers" {
@@ -8875,6 +9111,39 @@ pub unsafe fn dispatch_timer_callback(
     Ok(())
 }
 
+/// Dispatch tasks for single-isolate hosts (kawkab CLI, tests): timers, promises, workers.
+pub unsafe fn dispatch_cli_isolate_task(ctx: *mut qjs::JSContext, task: crate::event_loop::Task) {
+    use crate::event_loop::Task;
+    match task {
+        Task::TimerCallback { timer_id } => {
+            let _ = dispatch_timer_callback(ctx, timer_id);
+        }
+        Task::ResolvePromise {
+            promise_id,
+            payload,
+        } => {
+            let _ = host_resolve_promise(ctx, promise_id, payload);
+        }
+        Task::ResolvePromiseVoid { promise_id } => {
+            let _ = host_resolve_capability_void(ctx, promise_id);
+        }
+        Task::ResolvePromiseJson { promise_id, json } => {
+            let _ = host_resolve_promise_json(ctx, promise_id, &json);
+        }
+        Task::RejectPromise { promise_id, reason } => {
+            let _ = host_reject_promise(ctx, promise_id, &reason);
+        }
+        Task::WorkerPostToMain { worker_id, json } => {
+            worker_threads::dispatch_worker_post_to_main_deferred(ctx, worker_id, json);
+        }
+        Task::WorkerPostToWorker { json } => {
+            let _ = worker_threads::dispatch_worker_post_from_main(ctx, &json);
+        }
+        Task::WorkerThreadExit => {}
+        _ => {}
+    }
+}
+
 pub unsafe fn dispatch_dgram_message(
     ctx: *mut qjs::JSContext,
     socket_id: u64,
@@ -10019,11 +10288,11 @@ unsafe extern "C" fn js_http_res_end(
     js_undefined()
 }
 
-fn is_exception(value: qjs::JSValue) -> bool {
+pub(super) fn is_exception(value: qjs::JSValue) -> bool {
     value.tag == qjs::JS_TAG_EXCEPTION as i64
 }
 
-fn js_undefined() -> qjs::JSValue {
+pub(super) fn js_undefined() -> qjs::JSValue {
     qjs::JSValue {
         u: qjs::JSValueUnion { int32: 0 },
         tag: qjs::JS_TAG_UNDEFINED as i64,

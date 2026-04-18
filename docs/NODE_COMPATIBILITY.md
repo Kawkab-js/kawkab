@@ -95,8 +95,8 @@ Use this file plus a quick smoke test for any package you care about.
   - **Current behavior:** `runInNewContext(code, sandbox)` maps own string properties of `sandbox` to `Function` parameters and evaluates `code` as `return (<code>);` inside that function (expression-oriented, not full Node `Script` / VM isolation).
   - **To reach `🟢`:** isolated context guarantees and broader script/module execution parity.
 - `node:wasi` — `🔴` Not implemented.
-- `node:worker_threads` — `🟡` **Priority module; not 🟢 yet.** Baseline surface (`Worker` constructor, `postMessage`, `terminate`, `isMainThread`, stub `MessageChannel`/`parentPort`): **`Worker` does not run script in an isolated thread**; `postMessage` is a stub for typical message passing. Contract only asserts load + `isMainThread` + `Worker` typeof.
-  - **To reach `🟢`:** real multithreaded workers aligned with Node lifecycle, structured cloning, and channel semantics.
+- `node:worker_threads` — `🟢` **Baseline workers on real OS threads:** each `Worker` runs in its own **QuickJS isolate** on a dedicated Rust thread (`core/src/node/worker_threads.rs`). Main thread: `Worker` constructor (script path), `postMessage` / `on('message')`, `terminate`, `isMainThread`, `threadId`. Worker isolate: `parentPort.postMessage` / `parentPort.on('message')`. Messages are **JSON text** (values must round-trip via `JSON.stringify` / `JSON.parse`; otherwise a `TypeError` is thrown). Nested `Worker` from inside a worker is rejected. Contract: `node::compat_contract_tests::worker_threads_roundtrip` (and idle spawn smoke).
+  - **Remaining vs Node:** full **structured clone** (including `ArrayBuffer`, `SharedArrayBuffer`, transfer lists), `new Worker(new URL(...))` / `import.meta.url`, `workerData`, `MessageChannel` / `MessagePort` semantics, `resourceLimits`, `markAsUntransferable`, `receiveMessageOnPort`, `BroadcastChannel`, `setEnvironmentData` / `getEnvironmentData`, `performance` in worker, `eventLoopUtilization`, and full `events`/EventEmitter parity on `Worker`.
 - `node:inspector` — `🔴` Not implemented.
 - `node:repl` — `🔴` Not implemented.
 - `node:sqlite` — `🔴` Not implemented.
