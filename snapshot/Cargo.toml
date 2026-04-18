@@ -1,0 +1,10 @@
+[package]
+name = "snapshot"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+quickjs-sys = { workspace = true }
+core = { path = "../core" }
+memmap2 = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }

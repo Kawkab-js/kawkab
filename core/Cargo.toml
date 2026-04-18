@@ -1,0 +1,23 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+[dependencies]
+quickjs-sys.workspace = true
+tokio = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+libc = { workspace = true }
+io = { path = "../io" }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+httparse = { workspace = true }
+swc_core = { version = "63.1.3", features = ["common", "ecma_ast", "ecma_parser", "ecma_codegen", "ecma_transforms_typescript", "ecma_transforms_react", "ecma_visit", "ecma_transforms_module"] }
+ring = { workspace = true }
+getrandom = { workspace = true }
+base64 = "0.22"
+flate2 = { workspace = true }
+

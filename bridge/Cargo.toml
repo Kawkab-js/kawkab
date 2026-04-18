@@ -1,0 +1,7 @@
+[package]
+name = "bridge"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+quickjs-sys = { workspace = true }
+core = { path = "../core" }

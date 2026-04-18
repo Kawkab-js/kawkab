@@ -1,0 +1,34 @@
+/target/
+**/target/
+
+# Rust/Cargo
+Cargo.lock
+*.rs.bk
+
+# Environment files
+.env
+.env.*
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+
+scratch/
+
+# Local test artifacts
+run.out
+run.exit
+.build.log
+.build.exit

@@ -1,0 +1,30 @@
+[package]
+name = "kawkab-cli"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+tokio-uring = ["io/tokio-uring"]
+
+[[bin]]
+name = "kawkab"
+path = "src/main.rs"
+[dependencies]
+core = { path = "../core" }
+bridge = { path = "../bridge" }
+io = { path = "../io" }
+snapshot = { path = "../snapshot" }
+pm = { path = "../pm" }
+tokio = { workspace = true }
+mimalloc = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+num_cpus = { workspace = true }
+quickjs-sys.workspace = true
+serde_json = { workspace = true }
+
+[build-dependencies]
+cc = "1"

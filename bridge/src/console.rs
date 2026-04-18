@@ -1,0 +1,18 @@
+use core::error::JsError;
+use std::io::Write;
+
+pub fn install(isolate: &mut core::isolate::Isolate) -> Result<(), JsError> {
+    // Ensure bridge setup is executed against a live isolate.
+    let ctx = isolate.ctx_ptr();
+    if ctx.is_null() {
+        return Err(JsError::Runtime(
+            "bridge console install received null context".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn flush_all() {
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+}
