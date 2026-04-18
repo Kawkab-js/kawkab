@@ -2,7 +2,6 @@
 **/target/
 
 # Rust/Cargo
-Cargo.lock
 *.rs.bk
 
 # Environment files
