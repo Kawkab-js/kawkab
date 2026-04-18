@@ -1,15 +1,15 @@
 # Kawkab Node.js Compatibility
 
-Kawkab is moving toward complete Node.js compatibility. This page tracks API/module/global compatibility status in one place and is intended to be updated frequently.
+Kawkab expands **best-effort** alignment with Node.js **built-in names and rough API shape** over time; this is **not** a promise that every npm package will run unchanged. This page tracks API/module/global compatibility status in one place and is intended to be updated frequently.
 
-Compatibility target in this document is aligned to **Node.js v23** surface area for *naming and expectations*, not byte-for-byte parity.
+Compatibility target in this document is aligned to **Node.js v23** surface area for *naming and expectations*, not byte-for-byte parity with Node or universal registry coverage. For product-level scope and non-goals, see [`PRODUCT_VISION.md`](PRODUCT_VISION.md).
 
 ## What “npm compatibility” means here
 
 There is **no guarantee** that an arbitrary package from the public npm registry will run. Compatibility means:
 
 - **Built-ins:** Only the modules and globals listed below are implemented or shimmed; anything else is `🔴` unless it loads as **user JS** from `node_modules`.
-- **Loading:** CommonJS `require()` is implemented for the built-in table plus filesystem resolution (`resolve_module_path` / `resolve_module_path_with_kind` in [`core/src/node/module_loader.rs`](../core/src/node/module_loader.rs)). **`package.json` `"exports"`:** the `"."` entry may expose `require`, `import`, and `default` strings; resolution picks the path matching the load context (CJS vs ESM). Complex export maps, `imports`, and conditions beyond that subset are not fully handled. ESM `import`/`export` is handled by the QuickJS module loader when the entry or a dependency is ESM (see runtime bootstrap in [`core/src/node/mod.rs`](../core/src/node/mod.rs)).
+- **Loading:** CommonJS `require()` is implemented for the built-in table plus filesystem resolution (`resolve_module_path` / `resolve_module_path_with_kind` in [`core/src/node/module_loader.rs`](../core/src/node/module_loader.rs)). **Bare specifiers** split package name and subpath (e.g. `lodash/get`, `@scope/pkg/x`) before resolving under `node_modules`. **`package.json`** is parsed as JSON; **`"exports"`** supports the `"."` and subpath keys, conditional objects (including nested `node` groups), string/array targets, and a single `*` per pattern key/target pair; **`"imports"`** resolves internal `#…` specifiers from the nearest `package.json`. Condition order follows load context: for `require`, `require` → `node` → `development`/`production` (from `NODE_ENV`, defaulting to production) → `default`; for ESM `import`, `import` → `module` → `node` → same env → `default`. Edge cases not matching Node 23 exactly include some multi-star or highly unusual export maps. ESM `import`/`export` is handled by the QuickJS module loader when the entry or a dependency is ESM (see [`core/src/node/mod.rs`](../core/src/node/mod.rs)).
 - **Native addons:** `*.node` / N-API native modules are **not** supported.
 - **Policy:** `child_process` is disabled unless `KAWKAB_ALLOW_CHILD_PROCESS=1`.
 
@@ -24,7 +24,7 @@ Use this file plus a quick smoke test for any package you care about.
 | Path resolution, `package.json`, ESM/CJS detection | [`core/src/node/module_loader.rs`](../core/src/node/module_loader.rs), [`esm_loader`](../core/src/node/) |
 | CLI: order of setup, bytecode CJS wrapper | [`kawkab/src/main.rs`](../kawkab/src/main.rs) |
 
-**Built-in names handled inside `js_require` today:** `assert`, `buffer`, `console`, `process`, `fs`, `path`, `os`, `punycode`, `events`, `util`, `sys`, `net`, `http`, `https`, `child_process`, `stream`, `crypto`, `url`, `querystring`, `string_decoder`, `dgram`, `diagnostics_channel`, `dns`, `dns/promises`, `readline`, `zlib`, `tls`, `vm`, `worker_threads`, `timers`, `timers/promises`, `perf_hooks`, `node:test`, `test`. Any other specifier falls through to file / `node_modules` resolution (or fails).
+**Built-in names handled inside `js_require` today:** `assert`, `buffer`, `console`, `process`, `fs`, `path`, `os`, `punycode`, `events`, `util`, `sys`, `net`, `http`, `https`, `child_process`, `stream`, `crypto`, `url`, `querystring`, `string_decoder`, `dgram`, `diagnostics_channel`, `dns`, `dns/promises`, `readline`, `zlib`, `tls`, `vm`, `worker_threads`, `timers`, `timers/promises`, `perf_hooks`, `module`, `node:test`, `test`. Any other specifier falls through to file / `node_modules` resolution (or fails).
 
 ## Status Legend
 
@@ -73,7 +73,7 @@ Use this file plus a quick smoke test for any package you care about.
   - **To reach `🟢`:** algorithm matrix, encoding/error behavior, and cryptographic parity with Node.
 - `node:domain` — `🔴` Not implemented.
 - `node:http2` — `🔴` Not implemented.
-- `node:module` — `🟡` CommonJS loading subset is implemented; full Node `module` internals are not.
+- `node:module` — `🟡` **`createRequire(filename | file URL)`** returns a `require` function with resolution rooted at the parent directory of `filename` (after stripping a `file://` prefix). Other `module` APIs (`enableCompileCache`, `Module`, sync hooks, etc.) are not implemented.
 - `node:net` — `🟡` Compatibility entrypoint: same `createServer` shape as `http` for baseline usage.
 - `node:perf_hooks` — `🟡` Minimal export: `performance` re-exports the global `performance` object (`now`, `timeOrigin`).
   - **To reach `🟢`:** full `perf_hooks` API (`PerformanceObserver`, histograms, etc.) matching Node.

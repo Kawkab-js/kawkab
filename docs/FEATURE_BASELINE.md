@@ -18,7 +18,7 @@ This file is the **contractual baseline** for what the repository aims to ship. 
 
 ## Runtime capabilities (summary)
 
-- Execute JS/TS/JSX/TSX via transpilation; CommonJS `require` and ESM entrypoints as documented in `docs/NODE_COMPATIBILITY.md`.
+- Execute JS/TS/JSX/TSX via transpilation; CommonJS `require` and ESM entrypoints as documented in `docs/NODE_COMPATIBILITY.md`. Module resolution includes bare-specifier package/subpath splitting, `package.json` `exports` / `imports` (conditional and pattern subset), and `require('module').createRequire`.
 - Node compatibility is **best-effort**; built-ins and globals are a curated subset — see the compatibility matrix, not npm “works everywhere”.
 - **Security:** `child_process` and similar host capabilities are policy-gated (e.g. `KAWKAB_ALLOW_CHILD_PROCESS`); default is restrictive.
 
@@ -35,5 +35,6 @@ This file is the **contractual baseline** for what the repository aims to ship. 
 
 ## Documentation pairing
 
+- **Product vision (positioning, themes):** `docs/PRODUCT_VISION.md`
 - **Compatibility detail:** `docs/NODE_COMPATIBILITY.md`
 - **Release process:** `docs/RELEASE_CHECKLIST.md`

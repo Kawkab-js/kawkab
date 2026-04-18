@@ -1048,6 +1048,8 @@ dependencies = [
  "io",
  "libc",
  "ring 0.16.20",
+ "serde",
+ "serde_json",
  "swc_core",
  "thiserror 1.0.69",
  "tokio",

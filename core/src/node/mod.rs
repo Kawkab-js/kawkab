@@ -7005,6 +7005,11 @@ unsafe extern "C" fn js_require(
         let _ = install_obj_fn(ctx, obj, "describe", Some(js_node_test_run), 2);
         return obj;
     }
+    if request == "module" {
+        let obj = qjs::JS_NewObject(ctx);
+        let _ = install_obj_fn(ctx, obj, "createRequire", Some(js_module_create_require), 1);
+        return obj;
+    }
     let base = REQUIRE_BASE_DIR.with(|v| v.borrow().clone());
     let resolved = resolve_module_path(&base, &request);
 
@@ -7146,6 +7151,71 @@ unsafe extern "C" fn js_require(
     let out = qjs::JS_GetPropertyStr(ctx, module_obj, CString::new("exports").unwrap().as_ptr());
     crate::ffi::js_free_value(ctx, module_obj);
     out
+}
+
+fn strip_file_url(s: &str) -> String {
+    let s = s.trim();
+    if let Some(mut rest) = s.strip_prefix("file://") {
+        if let Some(r) = rest.strip_prefix("localhost") {
+            rest = r;
+        }
+        if rest.starts_with('/') && rest.as_bytes().get(3) == Some(&b':') {
+            return rest[1..].to_string();
+        }
+        rest.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+unsafe extern "C" fn js_module_create_require(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("createRequire(filename) requires filename")
+                .unwrap_or_default()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let url_or_path = js_string_to_owned(ctx, args[0]);
+    let filename = strip_file_url(&url_or_path);
+    let parent = Path::new(&filename)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    let parent_val = qjs_compat::new_string_from_str(ctx, &parent);
+    qjs::JS_NewCFunctionData(
+        ctx,
+        Some(js_require_bound_to_dir),
+        1,
+        0,
+        1,
+        &mut [parent_val] as *mut qjs::JSValue,
+    )
+}
+
+unsafe extern "C" fn js_require_bound_to_dir(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+    _magic: c_int,
+    data: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let base_dir = js_string_to_owned(ctx, *data);
+    let previous = REQUIRE_BASE_DIR.with(|v| {
+        let p = v.borrow().clone();
+        *v.borrow_mut() = base_dir;
+        p
+    });
+    let _guard = RequireBaseDirGuard { previous };
+    js_require(ctx, this_val, argc, argv)
 }
 
 unsafe extern "C" fn js_fs_exists_sync(

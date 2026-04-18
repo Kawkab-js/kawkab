@@ -8,6 +8,7 @@ Current state of this repository:
 - QuickJS FFI integration is now migrated to `hirofa-quickjs-sys 0.14.0` via a compatibility adapter (`core/src/qjs_compat.rs`).
 - CommonJS loading and several Node-like built-ins are available (see compatibility table below).
 - Feature baseline source-of-truth: `docs/FEATURE_BASELINE.md`.
+- Product positioning (sweet spots, non-goals, engineering themes): `docs/PRODUCT_VISION.md`.
 
 ## Project Structure
 
@@ -257,6 +258,7 @@ export KAWKAB_ALLOW_CHILD_PROCESS=1
 ## Release Readiness
 
 - Baseline contract: `docs/FEATURE_BASELINE.md`
+- Product vision: `docs/PRODUCT_VISION.md`
 - Release checklist: `docs/RELEASE_CHECKLIST.md`
 
 Create a zip archive (excluding `target`):
