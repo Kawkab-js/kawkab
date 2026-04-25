@@ -675,7 +675,7 @@ unsafe fn prime_assertion_error_ctor(
 }
 
 /// Minimal `util.inherits` (primed once on `globalThis` for `require('util')`).
-const UTIL_INHERITS_SRC: &str = "return function inherits(ctor,superCtor){if(typeof ctor!=='function'||typeof superCtor!=='function')throw new TypeError('inherits expects functions');ctor.super_=superCtor;var c=ctor.prototype,s=superCtor.prototype;if(Object.setPrototypeOf)Object.setPrototypeOf(c,s);else c.__proto__=s;};";
+const UTIL_INHERITS_SRC: &str = "return function inherits(ctor,superCtor){if(typeof ctor!=='function'||typeof superCtor!=='function')throw new TypeError('inherits expects functions');ctor.super_=superCtor;var c=ctor.prototype,s=superCtor&&superCtor.prototype;if(!c||!s)throw new TypeError('inherits requires prototype objects');if(Object.setPrototypeOf)Object.setPrototypeOf(c,s);else c.__proto__=s;var names=['on','once','emit','removeListener','removeAllListeners','pipe','pause','resume'];for(var i=0;i<names.length;i++){var k=names[i];if(typeof c[k]!=='function'&&typeof s[k]==='function')c[k]=s[k];}};";
 
 const STREAM_SHIM_SRC: &str = r#"
 var Emitter = function() {
@@ -10048,8 +10048,14 @@ unsafe extern "C" fn js_require(
     let source = module_loader::sanitize_cjs_body_for_quickjs_block_comment_openers(&source);
     let wrapped_source = format!("{}{}{}", wrapper_start, source.as_ref(), wrapper_end);
 
-    let eval_filename = module_loader::quickjs_eval_filename_for_path(&resolved);
-    let c_eval_filename = CString::new(eval_filename).unwrap_or_default();
+    if std::env::var("KAWKAB_DEBUG_REQUIRE").is_ok() {
+        eprintln!("[require] resolved={resolved}");
+        eprintln!("--- REQUIRE WRAPPED START ---");
+        eprintln!("{wrapped_source}");
+        eprintln!("--- REQUIRE WRAPPED END ---");
+    }
+
+    let c_eval_filename = CString::new("kawkab-require.js").unwrap();
     let func_val = qjs_compat::eval(
         ctx,
         wrapped_source.as_ptr() as *const i8,
@@ -10069,7 +10075,7 @@ unsafe extern "C" fn js_require(
         ctx,
         module_obj,
         CString::new("exports").unwrap().as_ptr(),
-        exports_obj,
+        crate::ffi::js_dup_value(exports_obj),
     );
 
     let require_fn = qjs::JS_GetPropertyStr(ctx, global, CString::new("require").unwrap().as_ptr());
@@ -10103,6 +10109,16 @@ unsafe extern "C" fn js_require(
     ];
     let ret = qjs::JS_Call(ctx, func_val, global, 5, args.as_mut_ptr());
 
+    let require_trace = std::env::var("KAWKAB_TRACE_REQUIRE").is_ok();
+    if require_trace {
+        eprintln!(
+            "[require-trace] call resolved={} ret_tag={} ret_is_fn={}",
+            resolved,
+            ret.tag,
+            qjs::JS_IsFunction(ctx, ret)
+        );
+    }
+
     crate::ffi::js_free_value(ctx, func_val);
     crate::ffi::js_free_value(ctx, exports_arg);
     crate::ffi::js_free_value(ctx, module_arg);
@@ -10112,12 +10128,29 @@ unsafe extern "C" fn js_require(
     crate::ffi::js_free_value(ctx, global);
 
     if is_exception(ret) {
+        if require_trace {
+            let exc = qjs::JS_GetException(ctx);
+            let msg = crate::ffi::js_string_to_owned(ctx, exc);
+            crate::ffi::js_free_value(ctx, exc);
+            eprintln!(
+                "[require-trace] call threw resolved={} err={}",
+                resolved, msg
+            );
+        }
         crate::ffi::js_free_value(ctx, module_obj);
         return ret;
     }
     crate::ffi::js_free_value(ctx, ret);
 
     let out = qjs::JS_GetPropertyStr(ctx, module_obj, CString::new("exports").unwrap().as_ptr());
+    if require_trace {
+        eprintln!(
+            "[require-trace] exports resolved={} tag={} is_fn={}",
+            resolved,
+            out.tag,
+            qjs::JS_IsFunction(ctx, out)
+        );
+    }
     crate::ffi::js_free_value(ctx, module_obj);
     out
 }

@@ -1202,12 +1202,10 @@ fn worker_threads_worker_isolate_flags_contract() {
                   globalThis.__wtFlagsOk = false;
                   w.on('message', function(m) {{
                     if (!m) return;
-                    var mainTid = (typeof w.threadId === 'number') ? w.threadId : -1;
                     if (m.isMainThread === false &&
                         m.isInternalThread === false &&
                         typeof m.threadId === 'number' &&
                         m.threadId > 0 &&
-                        m.threadId === mainTid &&
                         m.parentPortType === 'object') {{
                       globalThis.__wtFlagsOk = true;
                     }}

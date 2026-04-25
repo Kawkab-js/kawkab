@@ -5,13 +5,13 @@ This document is the **product-facing compatibility contract**: we optimize for 
 ## Target table
 
 
-| Tier                      | Goal     | Meaning                                                                                                                                                                             |
-| ------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Top 100 npm packages**  | **100%** | Of the frozen list in [`data/top100-packages.txt`](data/top100-packages.txt) (`docs/data/top100-packages.txt`), 100% pass the [pass criteria](#pass-criteria) for their **declared smoke scenario** on the **QuickJS** engine (see corpus). |
-| **Express ecosystem**     | **100%** | All **Express tier** scenarios in `[NPM_CORPUS.md](NPM_CORPUS.md)` pass (minimal app + common middleware + `listen` + HTTP request).                                                |
-| **NestJS**                | **100%** | All **NestJS tier** scenarios in the corpus pass (bootstrap + module + at least one HTTP route in the **defined scope**).                                                           |
-| **Prisma**                | **100%** | All **Prisma tier** scenarios in the corpus pass (`generate` + simple query against SQLite or another **explicitly documented** backend).                                           |
-| **Next.js custom server** | **90%**  | 90% of **Next custom server** scenarios in the corpus pass (`server.js` / `app.prepare()` + `createServer` path; **not** full Edge/SSR matrix).                                     |
+| Tier                      | Goal     | Meaning                                                                                                                                                                                                                                     |
+| ------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Top 100 npm packages**  | **100%** | Of the frozen list in `[data/top100-packages.txt](data/top100-packages.txt)` (`docs/data/top100-packages.txt`), 100% pass the [pass criteria](#pass-criteria) for their **declared smoke scenario** on the **QuickJS** engine (see corpus). |
+| **Express ecosystem**     | **100%** | All **Express tier** scenarios in `[NPM_CORPUS.md](NPM_CORPUS.md)` pass (minimal app + common middleware + `listen` + HTTP request).                                                                                                        |
+| **NestJS**                | **100%** | All **NestJS tier** scenarios in the corpus pass (bootstrap + module + at least one HTTP route in the **defined scope**).                                                                                                                   |
+| **Prisma**                | **100%** | All **Prisma tier** scenarios in the corpus pass (`generate` + simple query against SQLite or another **explicitly documented** backend).                                                                                                   |
+| **Next.js custom server** | **90%**  | 90% of **Next custom server** scenarios in the corpus pass (`server.js` / `app.prepare()` + `createServer` path; **not** full Edge/SSR matrix).                                                                                             |
 
 
 ## Pass criteria
@@ -26,7 +26,7 @@ A scenario **passes** when, on a supported Linux environment (see `[FEATURE_BASE
 
 ## Frozen Top 100 list
 
-- **File:** [`data/top100-packages.txt`](data/top100-packages.txt) — on disk: `docs/data/top100-packages.txt`
+- **File:** `[data/top100-packages.txt](data/top100-packages.txt)` — on disk: `docs/data/top100-packages.txt`
 - **Purpose:** Auditable denominator for the **100%** QuickJS KPI. Update the file only with an intentional **revision** (bump the `generated_on` / `revision` header inside the file) and adjust corpus rows accordingly.
 - **Not** a claim that every line is “#1 by downloads this week”; it is a **versioned basket** for regression tracking. Replace or extend via PR with rationale.
 
@@ -59,12 +59,11 @@ A scenario **passes** when, on a supported Linux environment (see `[FEATURE_BASE
 
 ## Automation
 
-- **KPI smoke:** [`scripts/kpi_smoke.sh`](../scripts/kpi_smoke.sh) — HTTP + Express tiers (see [`fixtures/kpi/README.md`](../fixtures/kpi/README.md)).
-- **Top 100 basket (CI):** after `npm ci` in [`fixtures/kpi/top100-qjs/`](../fixtures/kpi/top100-qjs/): [`scripts/top100_node_matrix.sh`](../scripts/top100_node_matrix.sh) (**gate**, must pass) then [`scripts/top100_qjs_matrix.sh`](../scripts/top100_qjs_matrix.sh) (`kawkab --engine quickjs`; **informational** until the KPI reaches 100/100 - failures do not fail the workflow step).
+- **KPI smoke:** `[scripts/kpi_smoke.sh](../scripts/kpi_smoke.sh)` — HTTP + Express tiers (see `[fixtures/kpi/README.md](../fixtures/kpi/README.md)`).
+- **Top 100 basket (CI):** after `npm ci` in `[fixtures/kpi/top100-qjs/](../fixtures/kpi/top100-qjs/)`: `[scripts/top100_node_matrix.sh](../scripts/top100_node_matrix.sh)` (**gate**, must pass) then `[scripts/top100_qjs_matrix.sh](../scripts/top100_qjs_matrix.sh)` (`kawkab --engine quickjs`; **informational** until the KPI reaches 100/100 - failures do not fail the workflow step).
 
 ## Related docs
 
 - `[COMPAT_DEFINITION_OF_DONE.md](COMPAT_DEFINITION_OF_DONE.md)` — 🟢/🟡 meanings
 - `[NPM_CORPUS.md](NPM_CORPUS.md)` — scenario tables per tier
 - `[PRODUCT_VISION.md](PRODUCT_VISION.md)` — positioning vs full Node parity
-
