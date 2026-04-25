@@ -11,7 +11,8 @@ use quickjs_sys as qjs;
 use crate::error::JsError;
 use crate::ffi::{js_dup_value, js_free_value, js_string_to_owned};
 use crate::node::module_loader::{
-    detect_source_type, resolve_module_path_with_kind, ModuleResolutionKind, SourceType,
+    detect_source_type, quickjs_eval_filename_for_path, resolve_module_path_with_kind,
+    ModuleResolutionKind, SourceType,
 };
 use crate::qjs_compat;
 
@@ -23,6 +24,13 @@ thread_local! {
     /// Canonical path -> bridged CJS exports value.
     static CJS_NS_CACHE: RefCell<HashMap<String, qjs::JSValue>> =
         RefCell::new(HashMap::new());
+}
+
+/// Drop cached `JSValue`s for this OS thread. Call when binding a **new** QuickJS runtime on the
+/// same thread: entries reference the previous runtime and will corrupt evaluation if reused.
+pub(crate) fn clear_thread_local_module_caches() {
+    ESM_NS_CACHE.with(|c| c.borrow_mut().clear());
+    CJS_NS_CACHE.with(|c| c.borrow_mut().clear());
 }
 
 /// Normalize specifier to canonical absolute path (`js_malloc` C string).
@@ -119,14 +127,15 @@ unsafe fn load_esm_module(
     };
     js_source.push('\n');
 
-    let c_path = CString::new(path).unwrap_or_default();
+    let eval_filename = quickjs_eval_filename_for_path(path);
+    let c_eval_name = CString::new(eval_filename).unwrap_or_default();
     let flags = (qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_COMPILE_ONLY) as i32;
 
     let func_val = qjs::JS_Eval(
         ctx,
         js_source.as_ptr() as *const c_char,
         js_source.len(),
-        c_path.as_ptr(),
+        c_eval_name.as_ptr(),
         flags,
     );
 
@@ -197,17 +206,20 @@ unsafe fn eval_cjs_source(ctx: *mut qjs::JSContext, js_source: &str, path: &str)
         .unwrap_or(Path::new("."))
         .to_string_lossy()
         .to_string();
+    let js_source =
+        crate::node::module_loader::sanitize_cjs_body_for_quickjs_block_comment_openers(js_source);
     let wrapper = format!(
         "(function(exports, require, module, __filename, __dirname) {{\n{}\n}})",
-        js_source
+        js_source.as_ref()
     );
 
-    let c_path = CString::new(path).unwrap_or_default();
+    let eval_filename = quickjs_eval_filename_for_path(path);
+    let c_eval_name = CString::new(eval_filename).unwrap_or_default();
     let func_val = qjs::JS_Eval(
         ctx,
         wrapper.as_ptr() as *const c_char,
         wrapper.len(),
-        c_path.as_ptr(),
+        c_eval_name.as_ptr(),
         qjs::JS_EVAL_TYPE_GLOBAL as i32,
     );
 
@@ -431,9 +443,14 @@ pub unsafe fn install_module_loader(rt: *mut qjs::JSRuntime) {
 }
 
 /// Evaluate ESM entry file; returns eval result/namespace JSValue.
+///
+/// `path` is the real filesystem path (reading source, `import.meta`, stack context).
+/// `qjs_eval_filename` is passed to QuickJS as the eval "filename" only; it must not
+/// embed substrings that QuickJS mis-parses as source (the CLI passes a stable synthetic name).
 pub unsafe fn eval_esm_entry(
     ctx: *mut qjs::JSContext,
     path: &str,
+    qjs_eval_filename: &str,
 ) -> Result<qjs::JSValue, JsError> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| JsError::Runtime(format!("Cannot read '{}': {}", path, e)))?;
@@ -442,14 +459,14 @@ pub unsafe fn eval_esm_entry(
         .map_err(|e| JsError::Runtime(format!("Transpile error '{}': {}", path, e)))?;
     js_source.push('\n');
 
-    let c_path = CString::new(path).unwrap_or_default();
+    let c_eval_name = CString::new(qjs_eval_filename).unwrap_or_default();
 
     let flags = (qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_COMPILE_ONLY) as i32;
     let func_val = qjs::JS_Eval(
         ctx,
         js_source.as_ptr() as *const c_char,
         js_source.len(),
-        c_path.as_ptr(),
+        c_eval_name.as_ptr(),
         flags,
     );
 

@@ -1,9 +1,8 @@
 (function () {
   var g = typeof globalThis !== "undefined" ? globalThis : typeof global !== "undefined" ? global : this;
 
-  function utf8Encode(str) {
+  function utf8EncodeManual(str) {
     str = String(str);
-    if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(str);
     var bytes = [];
     for (var i = 0; i < str.length; i++) {
       var c = str.charCodeAt(i);
@@ -30,8 +29,13 @@
     return new Uint8Array(bytes);
   }
 
-  function utf8Decode(bytes) {
-    if (typeof TextDecoder !== "undefined") return new TextDecoder("utf-8").decode(bytes);
+  function utf8Encode(str) {
+    str = String(str);
+    if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(str);
+    return utf8EncodeManual(str);
+  }
+
+  function utf8DecodeManual(bytes) {
     var s = "";
     for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
     try {
@@ -39,6 +43,11 @@
     } catch (e) {
       return s;
     }
+  }
+
+  function utf8Decode(bytes) {
+    if (typeof TextDecoder !== "undefined") return new TextDecoder("utf-8").decode(bytes);
+    return utf8DecodeManual(bytes);
   }
 
   function DOMException(message, name) {
@@ -619,6 +628,233 @@
     if (j >= 0) arr.splice(j, 1);
   };
 
+  // WHATWG text streams: do not rely on engine `TextEncoder` / `TextDecoder` (often absent in
+  // this QuickJS build). Use the same UTF-8 helpers as Blob / FormData paths.
+  var TextDecoderStream = function (encoding, options) {
+    if (!(this instanceof TextDecoderStream)) throw new TypeError("Illegal constructor");
+    var encArg = encoding != null ? String(encoding) : "utf-8";
+    if (encArg !== "utf-8" && encArg.toLowerCase() !== "utf8") {
+      throw new TypeError("TextDecoderStream: only utf-8 is supported in this embedding");
+    }
+    var chunks = [];
+    var ts = new TransformStream({
+      transform: function (chunk, ctrl) {
+        var u;
+        if (chunk instanceof ArrayBuffer) u = new Uint8Array(chunk);
+        else if (chunk instanceof Uint8Array) u = chunk;
+        else if (chunk && typeof chunk.byteLength === "number")
+          u = new Uint8Array(chunk.buffer, chunk.byteOffset || 0, chunk.byteLength);
+        else u = new Uint8Array(0);
+        if (u.byteLength) chunks.push(new Uint8Array(u));
+      },
+      flush: function (ctrl) {
+        var total = 0;
+        for (var i = 0; i < chunks.length; i++) total += chunks[i].length;
+        var merged = new Uint8Array(total);
+        var off = 0;
+        for (var j = 0; j < chunks.length; j++) {
+          merged.set(chunks[j], off);
+          off += chunks[j].length;
+        }
+        var str = utf8Decode(merged);
+        if (str) ctrl.enqueue(str);
+      },
+    });
+    this.readable = ts.readable;
+    this.writable = ts.writable;
+    this.encoding = "utf-8";
+    this.fatal = !!(options && options.fatal);
+    this.ignoreBOM = !!(options && options.ignoreBOM);
+  };
+
+  var TextEncoderStream = function () {
+    if (!(this instanceof TextEncoderStream)) throw new TypeError("Illegal constructor");
+    var ts = new TransformStream({
+      transform: function (chunk, ctrl) {
+        ctrl.enqueue(utf8Encode(String(chunk)));
+      },
+    });
+    this.readable = ts.readable;
+    this.writable = ts.writable;
+    this.encoding = "utf-8";
+  };
+
+  g.TextDecoderStream = TextDecoderStream;
+  g.TextEncoderStream = TextEncoderStream;
+
+  // Always install this Atomics object: the engine's native Atomics can abort
+  // (SIGABRT) on ordinary TypedArrays in this QuickJS embedding.
+  if (!g.__kawkabAtomicsShim) {
+    function atomicsBounds(ta, index) {
+      if (!ta || typeof ta.length !== "number") throw new TypeError("invalid typed array");
+      var i = index >>> 0;
+      if (i >= ta.length) throw new RangeError("out of bounds");
+      return i;
+    }
+    g.__kawkabAtomicsShim = true;
+    g.Atomics = {
+      isLockFree: function (size) {
+        var s = size | 0;
+        return s === 1 || s === 2 || s === 4 || s === 8;
+      },
+      load: function (ta, index) {
+        var i = atomicsBounds(ta, index);
+        return ta[i];
+      },
+      store: function (ta, index, value) {
+        var i = atomicsBounds(ta, index);
+        ta[i] = value;
+        return value;
+      },
+      add: function (ta, index, value) {
+        var i = atomicsBounds(ta, index);
+        var cur = ta[i];
+        ta[i] = cur + value;
+        return cur;
+      },
+      sub: function (ta, index, value) {
+        var i = atomicsBounds(ta, index);
+        var cur = ta[i];
+        ta[i] = cur - value;
+        return cur;
+      },
+      and: function (ta, index, value) {
+        var i = atomicsBounds(ta, index);
+        var cur = ta[i];
+        ta[i] = cur & value;
+        return cur;
+      },
+      or: function (ta, index, value) {
+        var i = atomicsBounds(ta, index);
+        var cur = ta[i];
+        ta[i] = cur | value;
+        return cur;
+      },
+      xor: function (ta, index, value) {
+        var i = atomicsBounds(ta, index);
+        var cur = ta[i];
+        ta[i] = cur ^ value;
+        return cur;
+      },
+      exchange: function (ta, index, value) {
+        var i = atomicsBounds(ta, index);
+        var cur = ta[i];
+        ta[i] = value;
+        return cur;
+      },
+      compareExchange: function (ta, index, expected, replacement) {
+        var i = atomicsBounds(ta, index);
+        var cur = ta[i];
+        if (cur === expected) ta[i] = replacement;
+        return cur;
+      },
+      wait: function () {
+        throw new TypeError("Atomics.wait is not supported in this embedding");
+      },
+      notify: function () {
+        return 0;
+      },
+    };
+  }
+
+  if (!g.PerformanceObserver) {
+    var PerformanceObserver = function (cb) {
+      if (!(this instanceof PerformanceObserver)) return new PerformanceObserver(cb);
+      this._cb = typeof cb === "function" ? cb : null;
+    };
+    PerformanceObserver.prototype.observe = function () {};
+    PerformanceObserver.prototype.disconnect = function () {};
+    PerformanceObserver.prototype.takeRecords = function () {
+      return [];
+    };
+    g.PerformanceObserver = PerformanceObserver;
+  }
+  if (!g.PerformanceResourceTiming) {
+    var PerformanceResourceTiming = function () {
+      this.entryType = "resource";
+      this.name = "";
+    };
+    g.PerformanceResourceTiming = PerformanceResourceTiming;
+  }
+  if (!g.PerformanceObserverEntryList) {
+    g.PerformanceObserverEntryList = function () {};
+  }
+
+  if (typeof g.__kawkabCryptoRandomBytesSync === "function") {
+    function kawkabBufSourceToU8(d) {
+      if (d instanceof ArrayBuffer) return new Uint8Array(d);
+      if (d && typeof d.byteLength === "number" && d.buffer)
+        return new Uint8Array(d.buffer, d.byteOffset || 0, d.byteLength);
+      throw new TypeError("invalid BufferSource");
+    }
+    function kawkabMapDigestAlg(algo) {
+      var name = algo && algo.name != null ? String(algo.name) : String(algo || "");
+      var u = name.toUpperCase().replace(/-/g, "");
+      if (u === "SHA1") return "sha1";
+      if (u === "SHA256") return "sha256";
+      if (u === "SHA384") return "sha384";
+      if (u === "SHA512") return "sha512";
+      return null;
+    }
+    var subtle = {
+      digest: function (algo, data) {
+        var g0 = g;
+        return new Promise(function (resolve, reject) {
+          try {
+            var a = kawkabMapDigestAlg(algo);
+            if (!a) throw new Error("unsupported digest algorithm");
+            var u8 = kawkabBufSourceToU8(data);
+            var id = g0.__kawkabCryptoCreateHash(a);
+            g0.__kawkabCryptoUpdate(id, u8);
+            resolve(g0.__kawkabCryptoDigest(id));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      },
+    };
+    g.crypto = {
+      getRandomValues: function (arr) {
+        if (!arr || typeof arr.length !== "number") throw new TypeError("unexpected type");
+        var len = arr.length | 0;
+        if (len > 65536) throw new TypeError("length out of range");
+        if (len < 1) return arr;
+        var ab = g.__kawkabCryptoRandomBytesSync(len);
+        var src = new Uint8Array(ab);
+        for (var i = 0; i < len; i++) arr[i] = src[i];
+        return arr;
+      },
+      randomUUID: function () {
+        var ab = g.__kawkabCryptoRandomBytesSync(16);
+        var b = new Uint8Array(ab);
+        b[6] = (b[6] & 0x0f) | 0x40;
+        b[8] = (b[8] & 0x3f) | 0x80;
+        var hex = [];
+        for (var i = 0; i < 16; i++) hex.push((b[i] < 16 ? "0" : "") + b[i].toString(16));
+        return (
+          hex.slice(0, 4).join("") +
+          "-" +
+          hex.slice(4, 6).join("") +
+          "-" +
+          hex.slice(6, 8).join("") +
+          "-" +
+          hex.slice(8, 10).join("") +
+          "-" +
+          hex.slice(10, 16).join("")
+        );
+      },
+      subtle: subtle,
+    };
+    function CryptoKey() {
+      throw new TypeError("Illegal constructor");
+    }
+    g.CryptoKey = CryptoKey;
+    function SubtleCrypto() {
+      throw new TypeError("Illegal constructor");
+    }
+    g.SubtleCrypto = SubtleCrypto;
+  }
+
   g.DOMException = DOMException;
   g.Event = Event;
   g.EventTarget = EventTarget;
@@ -644,6 +880,293 @@
   g.MessageChannel = MessageChannel;
   g.MessagePort = MessagePort;
   g.BroadcastChannel = BroadcastChannel;
+  if (typeof g.TextEncoder !== "function") {
+    g.TextEncoder = function TextEncoder() {
+      if (!(this instanceof TextEncoder)) return new TextEncoder();
+      this.encoding = "utf-8";
+    };
+    g.TextEncoder.prototype.encode = function (input) {
+      return utf8EncodeManual(input == null ? "" : String(input));
+    };
+  }
+  if (typeof g.TextDecoder !== "function") {
+    g.TextDecoder = function TextDecoder(label) {
+      if (!(this instanceof TextDecoder)) return new TextDecoder(label);
+      var enc = label == null ? "utf-8" : String(label).toLowerCase();
+      if (enc !== "utf-8" && enc !== "utf8") {
+        throw new TypeError("TextDecoder: only utf-8 is supported in this embedding");
+      }
+      this.encoding = "utf-8";
+    };
+    g.TextDecoder.prototype.decode = function (input) {
+      if (input == null) return "";
+      var u;
+      if (input instanceof Uint8Array) u = input;
+      else if (input instanceof ArrayBuffer) u = new Uint8Array(input);
+      else if (input && typeof input.byteLength === "number")
+        u = new Uint8Array(input.buffer, input.byteOffset || 0, input.byteLength);
+      else u = new Uint8Array(0);
+      return utf8DecodeManual(u);
+    };
+  }
+  if (typeof g.URLSearchParams !== "function") {
+    g.URLSearchParams = function URLSearchParams(init) {
+      if (!(this instanceof URLSearchParams)) return new URLSearchParams(init);
+      this._pairs = [];
+      var s = String(init || "");
+      if (s.charAt(0) === "?") s = s.slice(1);
+      if (!s) return;
+      var parts = s.split("&");
+      for (var i = 0; i < parts.length; i++) {
+        var p = parts[i];
+        if (!p) continue;
+        var j = p.indexOf("=");
+        var k = j >= 0 ? p.slice(0, j) : p;
+        var v = j >= 0 ? p.slice(j + 1) : "";
+        this._pairs.push([decodeURIComponent(k), decodeURIComponent(v)]);
+      }
+    };
+    g.URLSearchParams.prototype.append = function (k, v) {
+      this._pairs.push([String(k), String(v)]);
+    };
+    g.URLSearchParams.prototype.set = function (k, v) {
+      this.delete(k);
+      this.append(k, v);
+    };
+    g.URLSearchParams.prototype.get = function (k) {
+      k = String(k);
+      for (var i = 0; i < this._pairs.length; i++) if (this._pairs[i][0] === k) return this._pairs[i][1];
+      return null;
+    };
+    g.URLSearchParams.prototype.getAll = function (k) {
+      k = String(k);
+      var out = [];
+      for (var i = 0; i < this._pairs.length; i++) if (this._pairs[i][0] === k) out.push(this._pairs[i][1]);
+      return out;
+    };
+    g.URLSearchParams.prototype.delete = function (k) {
+      k = String(k);
+      var out = [];
+      for (var i = 0; i < this._pairs.length; i++) if (this._pairs[i][0] !== k) out.push(this._pairs[i]);
+      this._pairs = out;
+    };
+    g.URLSearchParams.prototype.toString = function () {
+      var out = [];
+      for (var i = 0; i < this._pairs.length; i++) out.push(encodeURIComponent(this._pairs[i][0]) + "=" + encodeURIComponent(this._pairs[i][1]));
+      return out.join("&");
+    };
+  }
+  if (typeof g.URL !== "function") {
+    g.URL = function URL(input, base) {
+      if (!(this instanceof URL)) return new URL(input, base);
+      var raw = String(input || "");
+      var abs = raw.indexOf("://") >= 0 ? raw : (String(base || "http://localhost").replace(/\/$/, "") + "/" + raw.replace(/^\//, ""));
+      var qIdx = abs.indexOf("?");
+      var hIdx = abs.indexOf("#");
+      var endPath = qIdx >= 0 ? qIdx : hIdx >= 0 ? hIdx : abs.length;
+      var protoIdx = abs.indexOf("://");
+      this.protocol = protoIdx >= 0 ? abs.slice(0, protoIdx + 1) : "http:";
+      var hostStart = protoIdx >= 0 ? protoIdx + 3 : 0;
+      var slashIdx = abs.indexOf("/", hostStart);
+      if (slashIdx < 0) slashIdx = endPath;
+      this.host = abs.slice(hostStart, slashIdx);
+      this.pathname = abs.slice(slashIdx, endPath) || "/";
+      this.search = qIdx >= 0 ? abs.slice(qIdx, hIdx >= 0 ? hIdx : abs.length) : "";
+      this.hash = hIdx >= 0 ? abs.slice(hIdx) : "";
+      this.searchParams = new g.URLSearchParams(this.search);
+    };
+    Object.defineProperty(g.URL.prototype, "href", {
+      get: function () {
+        var s = this.searchParams && this.searchParams.toString ? this.searchParams.toString() : "";
+        var q = s ? "?" + s : "";
+        return this.protocol + "//" + this.host + this.pathname + q + this.hash;
+      },
+    });
+    g.URL.prototype.toString = function () {
+      return this.href;
+    };
+  }
+  if (typeof g.Headers !== "function") {
+    g.Headers = function Headers(init) {
+      if (!(this instanceof Headers)) return new Headers(init);
+      this._map = {};
+      if (!init) return;
+      if (Array.isArray(init)) {
+        for (var i = 0; i < init.length; i++) this.append(init[i][0], init[i][1]);
+      } else if (typeof init === "object") {
+        var ks = Object.keys(init);
+        for (var j = 0; j < ks.length; j++) this.append(ks[j], init[ks[j]]);
+      }
+    };
+    g.Headers.prototype.append = function (k, v) {
+      k = String(k).toLowerCase();
+      v = String(v);
+      this._map[k] = this._map[k] ? this._map[k] + ", " + v : v;
+    };
+    g.Headers.prototype.set = function (k, v) {
+      this._map[String(k).toLowerCase()] = String(v);
+    };
+    g.Headers.prototype.get = function (k) {
+      k = String(k).toLowerCase();
+      return Object.prototype.hasOwnProperty.call(this._map, k) ? this._map[k] : null;
+    };
+    g.Headers.prototype.has = function (k) {
+      return Object.prototype.hasOwnProperty.call(this._map, String(k).toLowerCase());
+    };
+    g.Headers.prototype.delete = function (k) {
+      delete this._map[String(k).toLowerCase()];
+    };
+  }
+  if (typeof g.Request !== "function") {
+    g.Request = function Request(input, init) {
+      if (!(this instanceof Request)) return new Request(input, init);
+      init = init || {};
+      this.url = String(input || "");
+      this.method = String(init.method || "GET").toUpperCase();
+      this.headers = init.headers instanceof g.Headers ? init.headers : new g.Headers(init.headers);
+      this.body = init.body == null ? null : init.body;
+    };
+  }
+  if (typeof g.Response !== "function") {
+    g.Response = function Response(body, init) {
+      if (!(this instanceof Response)) return new Response(body, init);
+      init = init || {};
+      this.status = Number(init.status || 200);
+      this.statusText = String(init.statusText || "");
+      this.headers = init.headers instanceof g.Headers ? init.headers : new g.Headers(init.headers);
+      this._body = body == null ? "" : body;
+      this.ok = this.status >= 200 && this.status < 300;
+    };
+    g.Response.prototype.text = function () {
+      if (typeof this._body === "string") return Promise.resolve(this._body);
+      if (this._body instanceof Uint8Array) return Promise.resolve(utf8Decode(this._body));
+      if (this._body instanceof ArrayBuffer) return Promise.resolve(utf8Decode(new Uint8Array(this._body)));
+      return Promise.resolve(String(this._body));
+    };
+    g.Response.prototype.arrayBuffer = function () {
+      if (this._body instanceof ArrayBuffer) return Promise.resolve(this._body);
+      if (this._body instanceof Uint8Array) return Promise.resolve(this._body.buffer.slice(0));
+      return Promise.resolve(utf8Encode(String(this._body)).buffer);
+    };
+  }
+  if (typeof g.fetch !== "function") {
+    g.fetch = function fetch(input, init) {
+      var req = input instanceof g.Request ? input : new g.Request(input, init);
+      return Promise.resolve(new g.Response("", { status: 200, headers: req.headers }));
+    };
+  }
+  if (typeof g.WebAssembly !== "object" || !g.WebAssembly) {
+    function WasmCompileError(msg) {
+      this.name = "CompileError";
+      this.message = String(msg || "WebAssembly compile error");
+    }
+    WasmCompileError.prototype = Object.create(Error.prototype);
+    WasmCompileError.prototype.constructor = WasmCompileError;
+    function WasmLinkError(msg) {
+      this.name = "LinkError";
+      this.message = String(msg || "WebAssembly link error");
+    }
+    WasmLinkError.prototype = Object.create(Error.prototype);
+    WasmLinkError.prototype.constructor = WasmLinkError;
+    function WasmRuntimeError(msg) {
+      this.name = "RuntimeError";
+      this.message = String(msg || "WebAssembly runtime error");
+    }
+    WasmRuntimeError.prototype = Object.create(Error.prototype);
+    WasmRuntimeError.prototype.constructor = WasmRuntimeError;
+
+    function toWasmU8(bytes) {
+      if (bytes instanceof Uint8Array) return bytes;
+      if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+      if (bytes && typeof bytes.byteLength === "number" && bytes.buffer)
+        return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength);
+      throw new TypeError("WebAssembly bytes must be a BufferSource");
+    }
+    function wasmLooksValid(bytes) {
+      var u8 = toWasmU8(bytes);
+      return (
+        u8.length >= 8 &&
+        u8[0] === 0x00 &&
+        u8[1] === 0x61 &&
+        u8[2] === 0x73 &&
+        u8[3] === 0x6d &&
+        u8[4] === 0x01 &&
+        u8[5] === 0x00 &&
+        u8[6] === 0x00 &&
+        u8[7] === 0x00
+      );
+    }
+    function Module(bytes) {
+      if (!(this instanceof Module)) throw new TypeError("Illegal constructor");
+      if (!wasmLooksValid(bytes)) throw new WasmCompileError("invalid wasm module bytes");
+      this._bytes = toWasmU8(bytes);
+    }
+    function Instance(module, imports) {
+      if (!(this instanceof Instance)) throw new TypeError("Illegal constructor");
+      if (!(module instanceof Module)) throw new TypeError("first argument must be a WebAssembly.Module");
+      this.module = module;
+      this.imports = imports || {};
+      this.exports = {};
+    }
+    function Memory(desc) {
+      if (!(this instanceof Memory)) throw new TypeError("Illegal constructor");
+      desc = desc || {};
+      var pages = Number(desc.initial || 0);
+      this.buffer = new ArrayBuffer(Math.max(0, pages | 0) * 65536);
+    }
+    function Table(desc) {
+      if (!(this instanceof Table)) throw new TypeError("Illegal constructor");
+      desc = desc || {};
+      this.length = Number(desc.initial || 0) | 0;
+    }
+    function Global(desc, value) {
+      if (!(this instanceof Global)) throw new TypeError("Illegal constructor");
+      this.value = value;
+      this.mutable = !!(desc && desc.mutable);
+    }
+    g.WebAssembly = {
+      Module: Module,
+      Instance: Instance,
+      Memory: Memory,
+      Table: Table,
+      Global: Global,
+      CompileError: WasmCompileError,
+      LinkError: WasmLinkError,
+      RuntimeError: WasmRuntimeError,
+      validate: function (bytes) {
+        try {
+          return wasmLooksValid(bytes);
+        } catch (_e) {
+          return false;
+        }
+      },
+      compile: function (bytes) {
+        return new Promise(function (resolve, reject) {
+          try {
+            resolve(new Module(bytes));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      },
+      instantiate: function (source, imports) {
+        return new Promise(function (resolve, reject) {
+          try {
+            if (source instanceof Module) {
+              var i = new Instance(source, imports);
+              resolve({ module: source, instance: i });
+              return;
+            }
+            var m = new Module(source);
+            var inst = new Instance(m, imports);
+            resolve({ module: m, instance: inst });
+          } catch (e) {
+            reject(e);
+          }
+        });
+      },
+    };
+  }
 
   return true;
 })();

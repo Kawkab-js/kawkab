@@ -100,3 +100,7 @@ pub fn digest(id: u64) -> Result<Vec<u8>, String> {
         }
     })
 }
+
+pub(crate) fn clear_thread_local_registry() {
+    CRYPTO_REGISTRY.with(|r| r.borrow_mut().clear());
+}

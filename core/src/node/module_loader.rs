@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
@@ -404,6 +405,71 @@ pub fn require_should_run_transpile(path: &str) -> bool {
     matches!(ext, "ts" | "tsx" | "jsx")
 }
 
+#[inline]
+fn quickjs_jsdoc_opener_prev_ok(prev: Option<u8>) -> bool {
+    match prev {
+        None => true,
+        Some(p) => matches!(
+            p,
+            b'\n'
+                | b'\r'
+                | b' '
+                | b'\t'
+                | b'{'
+                | b'}'
+                | b';'
+                | b':'
+                | b'('
+                | b')'
+                | b'['
+                | b']'
+                | b','
+        ),
+    }
+}
+
+pub(crate) fn quickjs_eval_filename_for_path(path: &str) -> String {
+    let digest = blake3::hash(path.as_bytes());
+    let mut hex = String::with_capacity(16);
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for &b in &digest.as_bytes()[..8] {
+        hex.push(char::from(DIGITS[(b >> 4) as usize]));
+        hex.push(char::from(DIGITS[(b & 0x0f) as usize]));
+    }
+    format!("kawkab-mod-{hex}.js")
+}
+
+/// QuickJS can mis-tokenize `/**` / `/*!` block comment openers (especially after `{` / `;` /
+/// newlines inside the `require()` CJS wrapper) as regexp literals. Collapse each safe opener to
+/// `/*` so the comment body still ends at `*/` like Node/V8.
+pub(crate) fn sanitize_cjs_body_for_quickjs_block_comment_openers(src: &str) -> Cow<'_, str> {
+    let b = src.as_bytes();
+    let mut out: Option<String> = None;
+    let mut i = 0usize;
+    let mut seg_start = 0usize;
+    while i + 3 <= b.len() {
+        if b[i] == b'/' && b[i + 1] == b'*' && (b[i + 2] == b'*' || b[i + 2] == b'!') {
+            let prev = i.checked_sub(1).map(|j| b[j]);
+            if quickjs_jsdoc_opener_prev_ok(prev) {
+                let o = out.get_or_insert_with(|| String::with_capacity(src.len()));
+                o.push_str(&src[seg_start..i + 2]);
+                i += 3;
+                seg_start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    match out {
+        None => Cow::Borrowed(src),
+        Some(mut o) => {
+            o.push_str(&src[seg_start..]);
+            Cow::Owned(o)
+        }
+    }
+}
+
 /// Walk upward from `path` to find the nearest `package.json`.
 pub fn find_nearest_package_json(path: &str) -> Option<PackageJsonInfo> {
     let mut dir = PathBuf::from(path);
@@ -744,5 +810,54 @@ mod tests {
         assert_eq!(r, "./c.js");
         let e = resolve_exports_for_subpath(exp, ".", ModuleResolutionKind::Esm).unwrap();
         assert_eq!(e, "./e.mjs");
+    }
+
+    #[test]
+    fn quickjs_comment_sanitizer_leading_jsdoc() {
+        let s = "/**\n * @public\n */\n'use strict';\n";
+        let out = sanitize_cjs_body_for_quickjs_block_comment_openers(s);
+        assert_eq!(out.as_ref(), "/*\n * @public\n */\n'use strict';\n");
+    }
+
+    #[test]
+    fn quickjs_comment_sanitizer_mid_file_jsdoc() {
+        let s = "function f() {\n/**\n * @param x\n */\nreturn 1;\n}";
+        let out = sanitize_cjs_body_for_quickjs_block_comment_openers(s);
+        assert_eq!(
+            out.as_ref(),
+            "function f() {\n/*\n * @param x\n */\nreturn 1;\n}"
+        );
+    }
+
+    #[test]
+    fn quickjs_comment_sanitizer_license_banner() {
+        let s = "/*!\n * MIT\n */\n'use strict';\n";
+        let out = sanitize_cjs_body_for_quickjs_block_comment_openers(s);
+        assert_eq!(out.as_ref(), "/*\n * MIT\n */\n'use strict';\n");
+    }
+
+    #[test]
+    fn sanitizer_rewrites_real_merge_descriptors_fixture() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fixtures/kpi/express-minimal/node_modules/merge-descriptors/index.js");
+        if !path.exists() {
+            return;
+        }
+        let s = fs::read_to_string(&path).unwrap();
+        let out = sanitize_cjs_body_for_quickjs_block_comment_openers(&s);
+        assert_ne!(
+            out.as_ref(),
+            s.as_str(),
+            "fixture merge-descriptors should contain JSDoc openers to rewrite"
+        );
+        assert!(
+            !out.as_ref().contains("\n/**"),
+            "sanitized output should not contain raw newline-JSDoc openers"
+        );
+        assert!(
+            !out.as_ref().contains("/**"),
+            "sanitized merge-descriptors should contain no /** sequence: {}",
+            out.as_ref()
+        );
     }
 }

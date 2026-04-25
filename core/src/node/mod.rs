@@ -1,8 +1,8 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,6 +52,11 @@ struct PendingTimer {
     repeat_ms: Option<u64>,
 }
 
+struct PendingJsCall {
+    callback: qjs::JSValue,
+    args: Vec<qjs::JSValue>,
+}
+
 thread_local! {
     static REQUIRE_BASE_DIR: RefCell<String> = const { RefCell::new(String::new()) };
     static MODULE_SOURCE_CACHE: RefCell<std::collections::HashMap<String, String>> = RefCell::new(std::collections::HashMap::new());
@@ -68,6 +73,7 @@ thread_local! {
     static DGRAM_NATIVE_SOCKET_REGISTRY: RefCell<HashMap<u64, Arc<UdpSocket>>> = RefCell::new(HashMap::new());
     /// Receiver-loop cancellation flags keyed by runtime socket id.
     static DGRAM_RECV_CANCEL_BY_ID: RefCell<HashMap<u64, Arc<AtomicBool>>> = RefCell::new(HashMap::new());
+    static NEXT_TICK_QUEUE: RefCell<VecDeque<PendingJsCall>> = RefCell::new(VecDeque::new());
 }
 
 /// Restore [`REQUIRE_BASE_DIR`] after nested `require()` changes it.
@@ -125,6 +131,7 @@ static NEXT_TIMER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HTTP_BODY_ACCUM_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_DGRAM_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PROMISE_ID: AtomicU64 = AtomicU64::new(1);
+static TRACE_EVENTS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Count of async timers that have been scheduled but not yet fired/cancelled.
 /// Used by the CLI runner to decide when to exit.
@@ -213,8 +220,20 @@ pub unsafe fn install_runtime_with_embed(
     task_sender: Option<TaskSender>,
     embed: RuntimeEmbed,
 ) -> Result<(), String> {
+    worker_threads::clear_install_thread_js_handles(ctx);
+    crypto::clear_thread_local_registry();
     worker_threads::set_runtime_embed(embed);
     TASK_SENDER_SLOT.with(|s| *s.borrow_mut() = task_sender);
+    MODULE_SOURCE_CACHE.with(|c| c.borrow_mut().clear());
+    HTTP_LISTEN_REGISTRY.with(|c| c.borrow_mut().clear());
+    TIMER_REGISTRY.with(|c| c.borrow_mut().clear());
+    TIMER_CANCEL_BY_ID.with(|c| c.borrow_mut().clear());
+    HTTP_RESPONSE_WIRE_TX.with(|c| *c.borrow_mut() = None);
+    HTTP_BODY_ACCUM.with(|c| c.borrow_mut().clear());
+    DGRAM_NATIVE_SOCKET_REGISTRY.with(|c| c.borrow_mut().clear());
+    DGRAM_RECV_CANCEL_BY_ID.with(|c| c.borrow_mut().clear());
+    HOST_PENDING_PROMISES.with(|c| c.borrow_mut().clear());
+    esm_loader::clear_thread_local_module_caches();
     let entry_path = PathBuf::from(entry_filename);
     let base_dir = entry_path
         .parent()
@@ -301,7 +320,7 @@ pub unsafe fn install_runtime_with_embed(
     install_c_fn(ctx, global, "clearTimeout", Some(js_clear_timeout), 1)?;
     install_c_fn(ctx, global, "setInterval", Some(js_set_interval), 2)?;
     install_c_fn(ctx, global, "clearInterval", Some(js_clear_timeout), 1)?;
-    install_c_fn(ctx, global, "setImmediate", Some(js_set_timeout), 1)?;
+    install_c_fn(ctx, global, "setImmediate", Some(js_set_immediate), 1)?;
     install_c_fn(ctx, global, "clearImmediate", Some(js_clear_timeout), 1)?;
     install_c_fn(ctx, global, "queueMicrotask", Some(js_queue_microtask), 1)?;
 
@@ -501,6 +520,18 @@ pub unsafe fn install_runtime_with_embed(
     buffer::install(ctx, global)?;
     web_platform_shim::install(ctx, global)?;
 
+    let util_inherits = eval_js_module(ctx, "util-inherits", UTIL_INHERITS_SRC);
+    if is_exception(util_inherits) {
+        let exc = qjs::JS_GetException(ctx);
+        let detail = crate::ffi::js_string_to_owned(ctx, exc);
+        js_free_value(ctx, exc);
+        js_free_value(ctx, util_inherits);
+        js_free_value(ctx, global);
+        return Err(format!("util.inherits bootstrap failed: {detail}"));
+    }
+    let util_inh_key = CString::new("__kawkabUtilInherits").map_err(|e| e.to_string())?;
+    qjs::JS_SetPropertyStr(ctx, global, util_inh_key.as_ptr(), util_inherits);
+
     js_free_value(ctx, global);
     Ok(())
 }
@@ -604,11 +635,12 @@ unsafe fn set_str_prop(
 
 unsafe fn eval_js_module(ctx: *mut qjs::JSContext, name: &str, src: &str) -> qjs::JSValue {
     let wrapped = format!("(function(){{ {} }})()", src);
+    let wrapped_c = CString::new(wrapped).unwrap_or_default();
     let file = CString::new(format!("kawkab:{name}")).unwrap_or_default();
     qjs_compat::eval(
         ctx,
-        wrapped.as_ptr() as *const i8,
-        wrapped.len(),
+        wrapped_c.as_ptr(),
+        wrapped_c.as_bytes().len(),
         file.as_ptr(),
         qjs::JS_EVAL_TYPE_GLOBAL as i32,
     )
@@ -641,6 +673,9 @@ unsafe fn prime_assertion_error_ctor(
     qjs::JS_SetPropertyStr(ctx, global, key.as_ptr(), ctor_val);
     Ok(())
 }
+
+/// Minimal `util.inherits` (primed once on `globalThis` for `require('util')`).
+const UTIL_INHERITS_SRC: &str = "return function inherits(ctor,superCtor){if(typeof ctor!=='function'||typeof superCtor!=='function')throw new TypeError('inherits expects functions');ctor.super_=superCtor;var c=ctor.prototype,s=superCtor.prototype;if(Object.setPrototypeOf)Object.setPrototypeOf(c,s);else c.__proto__=s;};";
 
 const STREAM_SHIM_SRC: &str = r#"
 var Emitter = function() {
@@ -725,6 +760,19 @@ Readable.prototype.resume = function() {
   this.readableFlowing = true;
   this._flushBuffer();
   return this;
+};
+Readable.prototype.pipe = function(dest, options) {
+  options = options || {};
+  var shouldEnd = options.end !== false;
+  var self = this;
+  this.on('data', function(chunk) {
+    if (dest && typeof dest.write === 'function') dest.write(chunk);
+  });
+  this.on('end', function() {
+    if (shouldEnd && dest && typeof dest.end === 'function') dest.end();
+  });
+  self.resume();
+  return dest;
 };
 Readable.prototype._flushBuffer = function() {
   if (this._destroyed || this._paused) return;
@@ -949,6 +997,7 @@ __streamExports.Readable = Readable;
 __streamExports.Writable = Writable;
 __streamExports.Duplex = Duplex;
 __streamExports.Transform = Transform;
+__streamExports.Stream = Duplex;
 return __streamExports;
 "#;
 
@@ -1048,13 +1097,251 @@ EventEmitter.prototype.listeners = function(event) {
   return out;
 };
 EventEmitter.prototype.rawListeners = EventEmitter.prototype.listeners;
-var eventsOnce = function() { return {}; };
-var eventsOnAsyncIter = function() { return { next: function() { return { done: true }; } } ; };
+var eventsOnce = function(emitter, eventName) {
+  return new Promise(function(resolve, reject) {
+    if (!emitter || typeof emitter.on !== 'function' || typeof emitter.removeListener !== 'function') {
+      reject(new TypeError('events.once requires an EventEmitter instance'));
+      return;
+    }
+    var done = false;
+    var cleanup = function() {
+      if (done) return;
+      done = true;
+      try { emitter.removeListener(eventName, onEvent); } catch (_) {}
+      try { emitter.removeListener('error', onError); } catch (_) {}
+    };
+    var onEvent = function() {
+      cleanup();
+      var out = [];
+      for (var i = 0; i < arguments.length; i++) out.push(arguments[i]);
+      resolve(out);
+    };
+    var onError = function(err) {
+      cleanup();
+      reject(err || new Error('events.once error'));
+    };
+    emitter.on(eventName, onEvent);
+    if (eventName !== 'error') emitter.on('error', onError);
+  });
+};
+var eventsOnAsyncIter = function(emitter, eventName) {
+  var queue = [];
+  var waiters = [];
+  var stopped = false;
+  var failErr = null;
+  if (!emitter || typeof emitter.on !== 'function' || typeof emitter.removeListener !== 'function') {
+    throw new TypeError('events.on requires an EventEmitter instance');
+  }
+  var settle = function(item) {
+    if (waiters.length > 0) {
+      var w = waiters.shift();
+      w(item);
+    } else {
+      queue.push(item);
+    }
+  };
+  var onEvent = function() {
+    if (stopped) return;
+    var out = [];
+    for (var i = 0; i < arguments.length; i++) out.push(arguments[i]);
+    settle({ done: false, value: out });
+  };
+  var onError = function(err) {
+    if (stopped) return;
+    failErr = err || new Error('events.on error');
+    while (waiters.length) {
+      var w = waiters.shift();
+      w({ done: true, error: failErr });
+    }
+  };
+  var cleanup = function() {
+    if (stopped) return;
+    stopped = true;
+    try { emitter.removeListener(eventName, onEvent); } catch (_) {}
+    try { emitter.removeListener('error', onError); } catch (_) {}
+  };
+  emitter.on(eventName, onEvent);
+  if (eventName !== 'error') emitter.on('error', onError);
+  var iter = {
+    next: function() {
+      if (failErr) return Promise.reject(failErr);
+      if (queue.length > 0) {
+        var item = queue.shift();
+        if (item.error) return Promise.reject(item.error);
+        return Promise.resolve(item);
+      }
+      if (stopped) return Promise.resolve({ done: true, value: undefined });
+      return new Promise(function(resolve, reject) {
+        waiters.push(function(item) {
+          if (item && item.error) reject(item.error);
+          else resolve(item || { done: true, value: undefined });
+        });
+      });
+    },
+    return: function() {
+      cleanup();
+      return Promise.resolve({ done: true, value: undefined });
+    },
+    throw: function(err) {
+      cleanup();
+      return Promise.reject(err);
+    }
+  };
+  iter[Symbol.asyncIterator] = function() { return iter; };
+  return iter;
+};
 return { EventEmitter: EventEmitter, defaultMaxListeners: __defaultMaxListeners, once: eventsOnce, on: eventsOnAsyncIter };
 "##;
 
-const QUERYSTRING_SHIM_SRC: &str =
-    "var dec=decodeURIComponent;var enc=encodeURIComponent;var parse=function(str,sep,eq,options){var o={},s=String(str||''),sp='&',eqc='=',maxKeys=1000;if(typeof sep==='string')sp=sep;if(typeof eq==='string')eqc=eq;if(options&&typeof options==='object'){if(typeof options.maxKeys==='number'&&options.maxKeys>=0)maxKeys=options.maxKeys;}if(s.charAt(0)==='?')s=s.slice(1);if(!s)return o;var parts=s.split(sp),count=0;for(var i=0;i<parts.length;i++){if(maxKeys>0&&count>=maxKeys)break;var t=parts[i];if(!t)continue;var j=t.indexOf(eqc),k=j>=0?t.slice(0,j):t,v=j>=0?t.slice(j+eqc.length):'';try{k=dec(k.split('+').join(' '));v=dec(v.split('+').join(' '));}catch(e){};count++;if(Object.prototype.hasOwnProperty.call(o,k)){if(Array.isArray(o[k]))o[k].push(v);else o[k]=[o[k],v];}else o[k]=v;}return o;};var stringify=function(obj,sep,eq,options){if(!obj||typeof obj!=='object')return '';var sp='&',eqc='=';if(typeof sep==='string')sp=sep;if(typeof eq==='string')eqc=eq;var ks=Object.keys(obj),r=[];for(var i=0;i<ks.length;i++){var k=ks[i],v=obj[k],ek=enc(k).replace(/%20/g,'+');if(Array.isArray(v)){for(var j=0;j<v.length;j++){r.push(ek+eqc+enc(String(v[j])).replace(/%20/g,'+'));}}else{r.push(ek+eqc+enc(String(v)).replace(/%20/g,'+'));}}return r.join(sp);};var escape=function(s){return enc(String(s)).replace(/%20/g,'+');};var unescape=function(s){try{return dec(String(s).split('+').join(' '));}catch(e){return String(s);}};return{parse:parse,stringify:stringify,escape:escape,unescape:unescape};";
+const ASYNC_HOOKS_SHIM_SRC: &str = r##"
+var AsyncLocalStorage = function() {
+  if (!(this instanceof AsyncLocalStorage)) return new AsyncLocalStorage();
+  this._stack = [];
+};
+AsyncLocalStorage.prototype.run = function(store, callback) {
+  if (typeof callback !== 'function') throw new TypeError('callback must be a function');
+  this._stack.push(store);
+  try { return callback.apply(undefined, Array.prototype.slice.call(arguments, 2)); }
+  finally { this._stack.pop(); }
+};
+AsyncLocalStorage.prototype.enterWith = function(store) {
+  if (this._stack.length === 0) this._stack.push(store);
+  else this._stack[this._stack.length - 1] = store;
+};
+AsyncLocalStorage.prototype.getStore = function() {
+  if (this._stack.length === 0) return undefined;
+  return this._stack[this._stack.length - 1];
+};
+AsyncLocalStorage.prototype.exit = function(callback) {
+  if (typeof callback !== 'function') throw new TypeError('callback must be a function');
+  var prev = this._stack.slice();
+  this._stack = [];
+  try { return callback.apply(undefined, Array.prototype.slice.call(arguments, 1)); }
+  finally { this._stack = prev; }
+};
+AsyncLocalStorage.prototype.bind = function(fn) {
+  if (typeof fn !== 'function') throw new TypeError('fn must be a function');
+  var self = this;
+  var store = self.getStore();
+  return function() {
+    var args = Array.prototype.slice.call(arguments);
+    return self.run.apply(self, [store, fn].concat(args));
+  };
+};
+AsyncLocalStorage.prototype.disable = function() { this._stack = []; };
+var AsyncResource = function(type) { this.type = String(type || 'AsyncResource'); };
+AsyncResource.prototype.runInAsyncScope = function(fn, thisArg) {
+  if (typeof fn !== 'function') throw new TypeError('fn must be a function');
+  var args = Array.prototype.slice.call(arguments, 2);
+  return fn.apply(thisArg, args);
+};
+AsyncResource.prototype.emitDestroy = function() {};
+return {
+  AsyncLocalStorage: AsyncLocalStorage,
+  AsyncResource: AsyncResource,
+  executionAsyncId: function() { return 1; },
+  triggerAsyncId: function() { return 0; },
+  createHook: function() { return { enable: function(){return this;}, disable: function(){return this;} }; },
+  AsyncLocalStorageBind: function(fn) {
+    var als = new AsyncLocalStorage();
+    return als.bind(fn);
+  }
+};
+"##;
+
+const STRUCTURED_CLONE_POLYFILL_SRC: &str = r##"
+(function(g){
+  var current = g.structuredClone;
+  if (typeof current === 'function' && !current.__kawkabJsonOnly) return;
+  function cloneValue(value, seen) {
+    if (value === null || typeof value !== 'object') return value;
+    if (!seen) seen = new Map();
+    if (seen.has(value)) return seen.get(value);
+    if (value instanceof Date) return new Date(value.getTime());
+    if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+    if (value instanceof ArrayBuffer) return value.slice(0);
+    if (ArrayBuffer.isView(value)) return new value.constructor(value);
+    if (value instanceof Map) {
+      var m = new Map();
+      seen.set(value, m);
+      value.forEach(function(v, k){ m.set(cloneValue(k, seen), cloneValue(v, seen)); });
+      return m;
+    }
+    if (value instanceof Set) {
+      var s = new Set();
+      seen.set(value, s);
+      value.forEach(function(v){ s.add(cloneValue(v, seen)); });
+      return s;
+    }
+    var out = Array.isArray(value) ? [] : {};
+    seen.set(value, out);
+    var keys = Object.keys(value);
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      out[k] = cloneValue(value[k], seen);
+    }
+    return out;
+  }
+  var poly = function(value) { return cloneValue(value, new Map()); };
+  poly.__kawkabJsonOnly = false;
+  g.structuredClone = poly;
+})(globalThis);
+"##;
+
+const QUERYSTRING_SHIM_SRC: &str = r##"
+var dec = decodeURIComponent;
+var enc = encodeURIComponent;
+var parse = function(str, sep, eq, options) {
+  var o = {}, s = String(str || ''), sp = '&', eqc = '=', maxKeys = 1000;
+  if (typeof sep === 'string') sp = sep;
+  if (typeof eq === 'string') eqc = eq;
+  if (options && typeof options === 'object') {
+    if (typeof options.maxKeys === 'number' && options.maxKeys >= 0) maxKeys = options.maxKeys;
+  }
+  if (s.charAt(0) === '?') s = s.slice(1);
+  if (!s) return o;
+  var parts = s.split(sp), count = 0;
+  for (var i = 0; i < parts.length; i++) {
+    if (maxKeys > 0 && count >= maxKeys) break;
+    var t = parts[i];
+    if (!t) continue;
+    var j = t.indexOf(eqc), k = j >= 0 ? t.slice(0, j) : t, v = j >= 0 ? t.slice(j + eqc.length) : '';
+    try {
+      k = dec(k.split('+').join(' '));
+      v = dec(v.split('+').join(' '));
+    } catch (e) {}
+    count++;
+    if (Object.prototype.hasOwnProperty.call(o, k)) {
+      if (Array.isArray(o[k])) o[k].push(v);
+      else o[k] = [o[k], v];
+    } else o[k] = v;
+  }
+  return o;
+};
+var stringify = function(obj, sep, eq, options) {
+  if (!obj || typeof obj !== 'object') return '';
+  var sp = '&', eqc = '=';
+  if (typeof sep === 'string') sp = sep;
+  if (typeof eq === 'string') eqc = eq;
+  var ks = Object.keys(obj), r = [];
+  for (var i = 0; i < ks.length; i++) {
+    var k = ks[i], v = obj[k], ek = enc(k).replace(/%20/g, '+');
+    if (Array.isArray(v)) {
+      for (var j = 0; j < v.length; j++) {
+        r.push(ek + eqc + enc(String(v[j])).replace(/%20/g, '+'));
+      }
+    } else {
+      r.push(ek + eqc + enc(String(v)).replace(/%20/g, '+'));
+    }
+  }
+  return r.join(sp);
+};
+var escape = function(s) { return enc(String(s)).replace(/%20/g, '+'); };
+var unescape = function(s) {
+  try { return dec(String(s).split('+').join(' ')); } catch (e) { return String(s); }
+};
+return { parse: parse, stringify: stringify, escape: escape, unescape: unescape };
+"##;
 
 const CRYPTO_SHIM_SRC: &str = r#"
 const native = {
@@ -1179,50 +1466,103 @@ U.prototype.toString = function() { return this.href; };
 return { URL: U, URLSearchParams: QS };
 "#;
 
-const READLINE_SHIM_SRC: &str = r#"var createInterface=function(opt){opt=opt||{};return{input:opt.input,output:opt.output,terminal:!!opt.terminal,question:function(q,cb){if(typeof cb==="function")setTimeout(function(){cb("");},0);},on:function(){},once:function(){},off:function(){},close:function(){},pause:function(){},resume:function(){},write:function(){},setPrompt:function(){},prompt:function(cb){if(typeof cb==="function")setTimeout(cb,0);}};};return{createInterface:createInterface};"#;
-
-/// `perf_hooks` helpers (typical npm / feature-detection baseline).
-const PERF_HOOKS_HELPERS_SRC: &str = r#"
-function PerformanceObserver(cb) {
-  if (!(this instanceof PerformanceObserver)) return new PerformanceObserver(cb);
-  this._cb = typeof cb === 'function' ? cb : null;
-}
-PerformanceObserver.prototype.observe = function () {};
-PerformanceObserver.prototype.disconnect = function () {};
-PerformanceObserver.prototype.takeRecords = function () { return []; };
-function PerformanceEntry() {
-  this.entryType = '';
-  this.name = '';
-  this.startTime = 0;
-  this.duration = 0;
-}
-function PerformanceMark(name, options) {
-  this.name = String(name || '');
-  this.entryType = 'mark';
-  this.startTime = options && typeof options.startTime === 'number' ? options.startTime : 0;
-  this.duration = 0;
-}
-function PerformanceMeasure(name, options) {
-  this.name = String(name || '');
-  this.entryType = 'measure';
-  this.startTime = 0;
-  this.duration = 0;
-}
-function PerformanceResourceTiming() {
-  this.entryType = 'resource';
-  this.name = '';
-}
-function PerformanceObserverEntryList() {}
-return {
-  PerformanceObserver: PerformanceObserver,
-  PerformanceEntry: PerformanceEntry,
-  PerformanceMark: PerformanceMark,
-  PerformanceMeasure: PerformanceMeasure,
-  PerformanceResourceTiming: PerformanceResourceTiming,
-  PerformanceObserverEntryList: PerformanceObserverEntryList,
-  constants: { NODE_PERFORMANCE_GC_DURATION: 0 },
-  nodeTiming: {}
+const READLINE_SHIM_SRC: &str = r##"
+var createInterface = function(opt) {
+  opt = opt || {};
+  var handlers = {};
+  var promptText = '';
+  var rl = {
+    input: opt.input,
+    output: opt.output,
+    terminal: !!opt.terminal,
+    closed: false,
+    setPrompt: function(p) { promptText = String(p || ''); return this; },
+    prompt: function(cb) { if (typeof cb === 'function') setTimeout(cb, 0); this.emit('prompt', promptText); return this; },
+    question: function(_q, cb) {
+      if (typeof cb === 'function') setTimeout(function() { cb(''); }, 0);
+      return this;
+    },
+    write: function(_s) { return true; },
+    pause: function() { this.emit('pause'); return this; },
+    resume: function() { this.emit('resume'); return this; },
+    close: function() {
+      if (this.closed) return this;
+      this.closed = true;
+      this.emit('close');
+      return this;
+    },
+    on: function(ev, fn) {
+      if (typeof fn !== 'function') return this;
+      (handlers[ev] = handlers[ev] || []).push(fn);
+      return this;
+    },
+    once: function(ev, fn) {
+      if (typeof fn !== 'function') return this;
+      var self = this;
+      function wrap() { self.off(ev, wrap); fn.apply(self, arguments); }
+      return this.on(ev, wrap);
+    },
+    off: function(ev, fn) {
+      var arr = handlers[ev];
+      if (!arr) return this;
+      handlers[ev] = arr.filter(function(f) { return f !== fn; });
+      return this;
+    },
+    emit: function(ev) {
+      var args = Array.prototype.slice.call(arguments, 1);
+      var arr = (handlers[ev] || []).slice();
+      for (var i = 0; i < arr.length; i++) {
+        try { arr[i].apply(this, args); } catch (_) {}
+      }
+      return this;
+    }
+  };
+  return rl;
 };
+return { createInterface: createInterface };
+"##;
+
+const READLINE_PROMISES_SHIM_SRC: &str = r##"
+var base = require('readline');
+var createInterface = function(opt) {
+  var rl = base.createInterface(opt);
+  var rawQuestion = rl.question;
+  rl.question = function(q, opts) {
+    return new Promise(function(resolve, reject) {
+      try {
+        rawQuestion.call(rl, q, function(answer) { resolve(answer); });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  };
+  return rl;
+};
+return { createInterface: createInterface };
+"##;
+
+const TTY_SHIM_SRC: &str = r#"
+var isatty = function(fd){
+  return fd === 0 || fd === 1 || fd === 2;
+};
+var mk = function(fd){
+  var n = Number(fd);
+  if (!(n >= 0)) n = 0;
+  return { fd: n, isTTY: isatty(n) };
+};
+var ReadStream = function(fd){
+  if (!(this instanceof ReadStream)) return mk(fd);
+  var o = mk(fd);
+  this.fd = o.fd;
+  this.isTTY = o.isTTY;
+};
+var WriteStream = function(fd){
+  if (!(this instanceof WriteStream)) return mk(fd);
+  var o = mk(fd);
+  this.fd = o.fd;
+  this.isTTY = o.isTTY;
+};
+return { isatty: isatty, ReadStream: ReadStream, WriteStream: WriteStream };
 "#;
 
 const TIMERS_PROMISES_SET_INTERVAL_PATCH_SRC: &str = r#"
@@ -1293,6 +1633,82 @@ const DNS_SHIM_SRC: &str =
 
 const DNS_PROMISES_SHIM_SRC: &str =
     "var d=require('dns');function p(n,m){return function(){var a=[];for(var i=0;i<arguments.length;i++)a.push(arguments[i]);return new Promise(function(res,rej){a.push(function(err,x,y){if(err){rej(err);return;}if(m){res(m(x,y));return;}if(arguments.length<=2){res(x);return;}res([x,y]);});d[n].apply(d,a);});};}var out={};out.lookup=function(h,o){return new Promise(function(res,rej){d.lookup(h,o,function(err,address,family){if(err){rej(err);return;}if(o&&o.all){res(address);return;}res({address:address,family:family});});});};out.resolve=p('resolve');out.resolve4=p('resolve4');out.resolve6=p('resolve6');out.resolveAny=p('resolveAny');out.resolveCaa=p('resolveCaa');out.resolveCname=p('resolveCname');out.resolveMx=p('resolveMx');out.resolveNaptr=p('resolveNaptr');out.resolveNs=p('resolveNs');out.resolvePtr=p('resolvePtr');out.resolveSoa=p('resolveSoa');out.resolveSrv=p('resolveSrv');out.resolveTxt=p('resolveTxt');out.reverse=p('reverse');out.lookupService=p('lookupService',function(h,s){return {hostname:h,service:s};});out.getServers=function(){return d.getServers();};out.setServers=function(s){d.setServers(s);};function R(){}R.prototype.getServers=out.getServers;R.prototype.setServers=out.setServers;R.prototype.cancel=function(){};R.prototype.lookup=out.lookup;R.prototype.resolve=out.resolve;R.prototype.resolve4=out.resolve4;R.prototype.resolve6=out.resolve6;R.prototype.resolveAny=out.resolveAny;R.prototype.resolveCaa=out.resolveCaa;R.prototype.resolveCname=out.resolveCname;R.prototype.resolveMx=out.resolveMx;R.prototype.resolveNaptr=out.resolveNaptr;R.prototype.resolveNs=out.resolveNs;R.prototype.resolvePtr=out.resolvePtr;R.prototype.resolveSoa=out.resolveSoa;R.prototype.resolveSrv=out.resolveSrv;R.prototype.resolveTxt=out.resolveTxt;R.prototype.reverse=out.reverse;out.Resolver=R;return out;";
+
+const VM_SHIM_SRC: &str = r##"
+function runInThisContext(code) {
+  var src = String(code == null ? '' : code);
+  return (0, eval)(src);
+}
+function createContext(sandbox) {
+  var ctx = sandbox && typeof sandbox === 'object' ? sandbox : {};
+  Object.defineProperty(ctx, '__kawkabVmContext', { value: true, enumerable: false, configurable: true });
+  return ctx;
+}
+function isContext(value) {
+  return !!(value && typeof value === 'object' && value.__kawkabVmContext === true);
+}
+function runInContext(code, contextifiedObject) {
+  return runInNewContext(code, contextifiedObject || {});
+}
+function runInNewContext(code, sandbox) {
+  var ctx = createContext(sandbox || {});
+  var keys = Object.keys(ctx);
+  var vals = [];
+  for (var i = 0; i < keys.length; i++) vals.push(ctx[keys[i]]);
+  var body = String(code == null ? '' : code);
+  var fn = Function.apply(null, keys.concat(body));
+  return fn.apply(ctx, vals);
+}
+function Script(code) {
+  if (!(this instanceof Script)) return new Script(code);
+  this.code = String(code == null ? '' : code);
+}
+Script.prototype.runInThisContext = function() { return runInThisContext(this.code); };
+Script.prototype.runInContext = function(contextifiedObject) { return runInContext(this.code, contextifiedObject); };
+Script.prototype.runInNewContext = function(sandbox) { return runInNewContext(this.code, sandbox); };
+return { runInThisContext: runInThisContext, runInContext: runInContext, runInNewContext: runInNewContext, Script: Script, createContext: createContext, isContext: isContext };
+"##;
+
+const TLS_SHIM_SRC: &str = r##"
+function __mkSocket(host, port) {
+  var handlers = { secureConnect: [], error: [], close: [] };
+  var socket = {
+    authorized: false,
+    encrypted: true,
+    connecting: false,
+    destroyed: false,
+    remoteAddress: host || '127.0.0.1',
+    remotePort: Number(port || 443),
+    on: function(ev, fn) { if (typeof fn === 'function' && handlers[ev]) handlers[ev].push(fn); return this; },
+    once: function(ev, fn) { var self = this; return this.on(ev, function wrap(){ self.removeListener(ev, wrap); return fn.apply(this, arguments); }); },
+    removeListener: function(ev, fn) { if (!handlers[ev]) return this; handlers[ev] = handlers[ev].filter(function(f){ return f !== fn; }); return this; },
+    emit: function(ev) { var args = Array.prototype.slice.call(arguments, 1); (handlers[ev] || []).slice().forEach(function(fn){ try { fn.apply(socket, args); } catch (_) {} }); return this; },
+    write: function() { return true; },
+    end: function() { this.destroyed = true; this.emit('close'); },
+    destroy: function(err) { this.destroyed = true; if (err) this.emit('error', err); this.emit('close'); },
+    setEncoding: function() { return this; },
+    setKeepAlive: function() { return this; },
+    setNoDelay: function() { return this; }
+  };
+  setTimeout(function(){ socket.emit('secureConnect'); }, 0);
+  return socket;
+}
+function connect(port, host, cb) {
+  var p = port, h = host, onSecure = cb;
+  if (typeof port === 'object' && port) { p = port.port; h = port.host || port.servername; onSecure = host; }
+  if (typeof h === 'function') { onSecure = h; h = undefined; }
+  var s = __mkSocket(h, p);
+  if (typeof onSecure === 'function') s.on('secureConnect', onSecure);
+  return s;
+}
+function createServer(_options, listener) {
+  var http = require('http');
+  var srv = http.createServer(function(req, res) { if (typeof listener === 'function') listener(req, res); });
+  srv.setSecureContext = function() {};
+  return srv;
+}
+return { connect: connect, createServer: createServer, TLSSocket: function(){}, Server: function(){} };
+"##;
 
 unsafe fn prime_eval_shim_exports(
     ctx: *mut qjs::JSContext,
@@ -1370,7 +1786,9 @@ unsafe fn patch_timers_promises_set_interval(
         let detail = crate::ffi::js_string_to_owned(ctx, exc);
         js_free_value(ctx, exc);
         js_free_value(ctx, r);
-        return Err(format!("timers/promises setInterval patch failed: {detail}"));
+        return Err(format!(
+            "timers/promises setInterval patch failed: {detail}"
+        ));
     }
     js_free_value(ctx, r);
     Ok(())
@@ -1521,6 +1939,7 @@ unsafe extern "C" fn js_global_atob(
     qjs_compat::new_string_from_str(ctx, &out)
 }
 
+#[allow(dead_code)]
 unsafe extern "C" fn js_global_structured_clone_json(
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
@@ -1579,13 +1998,20 @@ unsafe fn install_web_compat_globals(ctx: *mut qjs::JSContext) {
     let global = qjs::JS_GetGlobalObject(ctx);
     let _ = install_c_fn(ctx, global, "btoa", Some(js_global_btoa), 1);
     let _ = install_c_fn(ctx, global, "atob", Some(js_global_atob), 1);
-    let _ = install_c_fn(
+    let sc = CString::new(STRUCTURED_CLONE_POLYFILL_SRC).unwrap();
+    let sc_file = CString::new("kawkab:structured-clone-polyfill").unwrap();
+    let sc_ret = qjs_compat::eval(
         ctx,
-        global,
-        "structuredClone",
-        Some(js_global_structured_clone_json),
-        1,
+        sc.as_ptr(),
+        sc.as_bytes().len(),
+        sc_file.as_ptr(),
+        qjs::JS_EVAL_TYPE_GLOBAL as i32,
     );
+    if !is_exception(sc_ret) {
+        js_free_value(ctx, sc_ret);
+    } else {
+        js_free_value(ctx, sc_ret);
+    }
     let loose = CString::new("globalThis.__kawkabLooseEq=function(a,b){return a==b;};").unwrap();
     let file = CString::new("kawkab:loose-eq").unwrap();
     let _ = qjs_compat::eval(
@@ -1808,13 +2234,384 @@ unsafe extern "C" fn js_noop(
     js_undefined()
 }
 
-unsafe extern "C" fn js_return_empty_object(
+unsafe extern "C" fn js_return_empty_string(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    qjs_compat::new_string_from_str(ctx, "")
+}
+
+unsafe extern "C" fn js_trace_create_tracing(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let obj = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, obj, "enable", Some(js_trace_enable), 0);
+    let _ = install_obj_fn(ctx, obj, "disable", Some(js_trace_disable), 0);
+    obj
+}
+
+unsafe extern "C" fn js_trace_enable(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    TRACE_EVENTS_ENABLED.store(true, Ordering::Relaxed);
+    qjs::JS_NewBool(ctx, true)
+}
+
+unsafe extern "C" fn js_trace_disable(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    TRACE_EVENTS_ENABLED.store(false, Ordering::Relaxed);
+    qjs::JS_NewBool(ctx, false)
+}
+
+unsafe extern "C" fn js_trace_get_enabled_categories(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if TRACE_EVENTS_ENABLED.load(Ordering::Relaxed) {
+        qjs_compat::new_string_from_str(ctx, "node")
+    } else {
+        qjs_compat::new_string_from_str(ctx, "")
+    }
+}
+
+unsafe extern "C" fn js_inspector_open(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let session = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, session, "post", Some(js_noop), 3);
+    let _ = install_obj_fn(ctx, session, "disconnect", Some(js_noop), 0);
+    let _ = install_obj_fn(ctx, session, "on", Some(js_noop), 2);
+    session
+}
+
+unsafe extern "C" fn js_repl_start(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let server = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        server,
+        CString::new("context").unwrap().as_ptr(),
+        qjs::JS_NewObject(ctx),
+    );
+    let _ = install_obj_fn(ctx, server, "defineCommand", Some(js_noop), 2);
+    let _ = install_obj_fn(ctx, server, "displayPrompt", Some(js_noop), 0);
+    let _ = install_obj_fn(ctx, server, "setupHistory", Some(js_noop), 2);
+    let _ = install_obj_fn(ctx, server, "close", Some(js_noop), 0);
+    server
+}
+
+unsafe extern "C" fn js_domain_create(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let domain = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, domain, "on", Some(js_noop), 2);
+    let _ = install_obj_fn(ctx, domain, "run", Some(js_noop), 1);
+    let _ = install_obj_fn(ctx, domain, "bind", Some(js_noop), 1);
+    let _ = install_obj_fn(ctx, domain, "intercept", Some(js_noop), 1);
+    let _ = install_obj_fn(ctx, domain, "add", Some(js_noop), 1);
+    let _ = install_obj_fn(ctx, domain, "remove", Some(js_noop), 1);
+    let _ = install_obj_fn(ctx, domain, "dispose", Some(js_noop), 0);
+    domain
+}
+
+unsafe extern "C" fn js_return_one_int(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    qjs_compat::new_int(ctx, 1)
+}
+
+unsafe extern "C" fn js_return_true(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    qjs::JS_NewBool(ctx, true)
+}
+
+unsafe extern "C" fn js_return_zero_int(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    qjs_compat::new_int(ctx, 0)
+}
+
+unsafe extern "C" fn js_v8_heap_statistics(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let obj = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("total_heap_size").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("used_heap_size").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("heap_size_limit").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("total_available_size").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("malloced_memory").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("peak_malloced_memory").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    obj
+}
+
+unsafe extern "C" fn js_cluster_fork(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let obj = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("id").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 1),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("isConnected").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("isDead").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    let _ = install_obj_fn(ctx, obj, "send", Some(js_noop), 1);
+    let _ = install_obj_fn(ctx, obj, "kill", Some(js_noop), 1);
+    let _ = install_obj_fn(ctx, obj, "disconnect", Some(js_noop), 0);
+    let _ = install_obj_fn(ctx, obj, "on", Some(js_noop), 2);
+    let _ = install_obj_fn(ctx, obj, "once", Some(js_noop), 2);
+    let proc = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        proc,
+        CString::new("pid").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 1),
+    );
+    qjs::JS_SetPropertyStr(ctx, obj, CString::new("process").unwrap().as_ptr(), proc);
+    obj
+}
+
+unsafe extern "C" fn js_cluster_setup_primary(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let settings = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        settings,
+        CString::new("schedulingPolicy").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 1),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        settings,
+        CString::new("silent").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    settings
+}
+
+unsafe extern "C" fn js_http2_server_like(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let obj = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, obj, "listen", Some(js_noop), 2);
+    let _ = install_obj_fn(ctx, obj, "close", Some(js_noop), 1);
+    let _ = install_obj_fn(ctx, obj, "on", Some(js_noop), 2);
+    let _ = install_obj_fn(ctx, obj, "emit", Some(js_noop), 2);
+    obj
+}
+
+unsafe extern "C" fn js_http2_client_like(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let obj = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, obj, "request", Some(js_http2_client_request_stream), 1);
+    let _ = install_obj_fn(ctx, obj, "close", Some(js_noop), 0);
+    let _ = install_obj_fn(ctx, obj, "destroy", Some(js_noop), 0);
+    let _ = install_obj_fn(ctx, obj, "on", Some(js_noop), 2);
+    obj
+}
+
+unsafe extern "C" fn js_http2_client_request_stream(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let stream = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, stream, "on", Some(js_noop), 2);
+    let _ = install_obj_fn(ctx, stream, "end", Some(js_noop), 1);
+    let _ = install_obj_fn(ctx, stream, "close", Some(js_noop), 0);
+    let _ = install_obj_fn(ctx, stream, "setEncoding", Some(js_noop), 1);
+    stream
+}
+
+unsafe extern "C" fn js_sqlite_database_ctor(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let obj = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, obj, "exec", Some(js_noop), 1);
+    let _ = install_obj_fn(ctx, obj, "prepare", Some(js_sqlite_prepare_stmt), 1);
+    let _ = install_obj_fn(ctx, obj, "close", Some(js_noop), 0);
+    obj
+}
+
+unsafe extern "C" fn js_sqlite_prepare_stmt(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let stmt = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, stmt, "run", Some(js_sqlite_stmt_run), 1);
+    let _ = install_obj_fn(ctx, stmt, "get", Some(js_sqlite_stmt_get), 1);
+    let _ = install_obj_fn(ctx, stmt, "all", Some(js_sqlite_stmt_all), 1);
+    let _ = install_obj_fn(ctx, stmt, "finalize", Some(js_noop), 0);
+    stmt
+}
+
+unsafe extern "C" fn js_sqlite_stmt_run(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let out = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        out,
+        CString::new("changes").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        out,
+        CString::new("lastInsertRowid").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    out
+}
+
+unsafe extern "C" fn js_sqlite_stmt_get(
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
     _argc: c_int,
     _argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
     qjs::JS_NewObject(ctx)
+}
+
+unsafe extern "C" fn js_sqlite_stmt_all(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    qjs::JS_NewArray(ctx)
+}
+
+unsafe extern "C" fn js_wasi_ctor(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let obj = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, obj, "start", Some(js_return_zero_int), 1);
+    let _ = install_obj_fn(ctx, obj, "initialize", Some(js_return_zero_int), 1);
+    let wasi_import = qjs::JS_NewObject(ctx);
+    let snapshot = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, snapshot, "proc_exit", Some(js_return_zero_int), 1);
+    let _ = install_obj_fn(ctx, snapshot, "fd_write", Some(js_return_zero_int), 4);
+    let _ = install_obj_fn(ctx, snapshot, "fd_read", Some(js_return_zero_int), 4);
+    let _ = install_obj_fn(ctx, snapshot, "environ_get", Some(js_return_zero_int), 2);
+    let _ = install_obj_fn(ctx, snapshot, "args_get", Some(js_return_zero_int), 2);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        wasi_import,
+        CString::new("wasi_snapshot_preview1").unwrap().as_ptr(),
+        snapshot,
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("wasiImport").unwrap().as_ptr(),
+        wasi_import,
+    );
+    obj
 }
 
 unsafe fn dgram_set_socket_error(ctx: *mut qjs::JSContext, sock: qjs::JSValue, message: &str) {
@@ -3612,18 +4409,38 @@ unsafe extern "C" fn js_diag_bounded_channel(
 
 #[allow(dead_code)]
 fn dns_family_and_addr(host: &str, force_family: Option<i32>) -> (String, i32) {
-    let family = force_family.unwrap_or_else(|| if host.contains(':') { 6 } else { 4 });
-    if family == 6 {
-        if host.is_empty() || host == "localhost" {
-            ("::1".to_string(), 6)
-        } else {
-            (host.to_string(), 6)
+    let preferred = force_family.unwrap_or_else(|| if host.contains(':') { 6 } else { 4 });
+    let normalized = if host.is_empty() { "localhost" } else { host };
+    let mut v4: Option<String> = None;
+    let mut v6: Option<String> = None;
+    if let Ok(iter) = (normalized, 0u16).to_socket_addrs() {
+        for addr in iter {
+            match addr.ip() {
+                IpAddr::V4(ip) if v4.is_none() => v4 = Some(ip.to_string()),
+                IpAddr::V6(ip) if v6.is_none() => v6 = Some(ip.to_string()),
+                _ => {}
+            }
+            if v4.is_some() && v6.is_some() {
+                break;
+            }
         }
-    } else if host.is_empty() || host == "localhost" {
-        ("127.0.0.1".to_string(), 4)
-    } else {
-        (host.to_string(), 4)
     }
+    if preferred == 6 {
+        if let Some(ip) = v6 {
+            return (ip, 6);
+        }
+        if let Some(ip) = v4 {
+            return (ip, 4);
+        }
+        return ("::1".to_string(), 6);
+    }
+    if let Some(ip) = v4 {
+        return (ip, 4);
+    }
+    if let Some(ip) = v6 {
+        return (ip, 6);
+    }
+    ("127.0.0.1".to_string(), 4)
 }
 
 #[allow(dead_code)]
@@ -3758,6 +4575,7 @@ unsafe extern "C" fn js_dns_resolve6(
     js_undefined()
 }
 
+#[allow(dead_code)]
 unsafe extern "C" fn js_vm_run_in_this_context(
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
@@ -3780,6 +4598,7 @@ unsafe extern "C" fn js_vm_run_in_this_context(
 }
 
 /// `vm.runInNewContext`: sandbox string keys become params; compile `return (<code>);`.
+#[allow(dead_code)]
 unsafe fn vm_run_in_new_context_with_sandbox(
     ctx: *mut qjs::JSContext,
     code: &str,
@@ -3915,6 +4734,7 @@ unsafe fn vm_run_in_new_context_with_sandbox(
     out
 }
 
+#[allow(dead_code)]
 unsafe extern "C" fn js_vm_run_in_new_context(
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
@@ -3984,12 +4804,15 @@ unsafe extern "C" fn js_string_decoder_write(
     argc: c_int,
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
-    let enc_js =
-        qjs::JS_GetPropertyStr(ctx, this, CString::new("__kawkabEnc").unwrap().as_ptr());
+    let enc_js = qjs::JS_GetPropertyStr(ctx, this, CString::new("__kawkabEnc").unwrap().as_ptr());
     let enc_raw = js_string_to_owned(ctx, enc_js);
     js_free_value(ctx, enc_js);
     let enc = enc_raw.to_ascii_lowercase();
-    let enc = if enc.is_empty() { "utf8".to_string() } else { enc };
+    let enc = if enc.is_empty() {
+        "utf8".to_string()
+    } else {
+        enc
+    };
 
     let carry_js =
         qjs::JS_GetPropertyStr(ctx, this, CString::new("__kawkabCarry").unwrap().as_ptr());
@@ -4020,13 +4843,7 @@ unsafe extern "C" fn js_string_decoder_write(
         "ascii" => {
             let s: String = carry
                 .iter()
-                .map(|&b| {
-                    if b < 128 {
-                        b as char
-                    } else {
-                        '\u{FFFD}'
-                    }
-                })
+                .map(|&b| if b < 128 { b as char } else { '\u{FFFD}' })
                 .collect();
             (s, Vec::new())
         }
@@ -4053,11 +4870,8 @@ unsafe extern "C" fn js_string_decoder_ctor(
     argc: c_int,
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
-    let proto = qjs::JS_GetPropertyStr(
-        ctx,
-        new_target,
-        CString::new("prototype").unwrap().as_ptr(),
-    );
+    let proto =
+        qjs::JS_GetPropertyStr(ctx, new_target, CString::new("prototype").unwrap().as_ptr());
     let obj = if qjs::JS_IsObject(proto) {
         let o = qjs::JS_NewObjectProto(ctx, proto);
         js_free_value(ctx, proto);
@@ -4114,7 +4928,10 @@ fn to_hex_bytes(input: &[u8]) -> String {
     out
 }
 
-unsafe fn js_worker_read_id(ctx: *mut qjs::JSContext, this_val: qjs::JSValue) -> Result<u64, qjs::JSValue> {
+unsafe fn js_worker_read_id(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+) -> Result<u64, qjs::JSValue> {
     let key = CString::new("__kawkabWorkerId").unwrap();
     let idv = qjs::JS_GetPropertyStr(ctx, this_val, key.as_ptr());
     if qjs::JS_IsUndefined(idv) || qjs::JS_IsNull(idv) {
@@ -4130,16 +4947,77 @@ unsafe fn js_worker_read_id(ctx: *mut qjs::JSContext, this_val: qjs::JSValue) ->
     Ok(d as u64)
 }
 
+unsafe fn js_worker_resource_limit_from_options(
+    ctx: *mut qjs::JSContext,
+    options_val: qjs::JSValue,
+    key: &str,
+) -> i64 {
+    if !qjs::JS_IsObject(options_val) {
+        return 0;
+    }
+    let limits = qjs::JS_GetPropertyStr(
+        ctx,
+        options_val,
+        CString::new("resourceLimits").unwrap().as_ptr(),
+    );
+    if !qjs::JS_IsObject(limits) {
+        js_free_value(ctx, limits);
+        return 0;
+    }
+    let raw = qjs::JS_GetPropertyStr(ctx, limits, CString::new(key).unwrap().as_ptr());
+    js_free_value(ctx, limits);
+    if qjs::JS_IsUndefined(raw) || qjs::JS_IsNull(raw) {
+        js_free_value(ctx, raw);
+        return 0;
+    }
+    let mut n: f64 = 0.0;
+    let ok = qjs::JS_ToFloat64(ctx, &mut n as *mut f64, raw) == 0;
+    js_free_value(ctx, raw);
+    if !ok || !n.is_finite() || n < 0.0 {
+        0
+    } else {
+        n.floor() as i64
+    }
+}
+
+unsafe fn js_worker_threads_share_env_value(ctx: *mut qjs::JSContext) -> qjs::JSValue {
+    let global = qjs::JS_GetGlobalObject(ctx);
+    let symbol_obj = qjs::JS_GetPropertyStr(ctx, global, CString::new("Symbol").unwrap().as_ptr());
+    if !qjs::JS_IsObject(symbol_obj) {
+        js_free_value(ctx, symbol_obj);
+        js_free_value(ctx, global);
+        return qjs::JS_NewObject(ctx);
+    }
+    let for_fn = qjs::JS_GetPropertyStr(ctx, symbol_obj, CString::new("for").unwrap().as_ptr());
+    if qjs::JS_IsFunction(ctx, for_fn) == 0 {
+        js_free_value(ctx, for_fn);
+        js_free_value(ctx, symbol_obj);
+        js_free_value(ctx, global);
+        return qjs::JS_NewObject(ctx);
+    }
+    let arg = qjs_compat::new_string_from_str(ctx, "nodejs.worker_threads.SHARE_ENV");
+    let mut argv = [arg];
+    let out = qjs::JS_Call(ctx, for_fn, symbol_obj, 1, argv.as_mut_ptr());
+    js_free_value(ctx, arg);
+    js_free_value(ctx, for_fn);
+    js_free_value(ctx, symbol_obj);
+    js_free_value(ctx, global);
+    if is_exception(out) {
+        let exc = qjs::JS_GetException(ctx);
+        js_free_value(ctx, exc);
+        js_free_value(ctx, out);
+        return qjs::JS_NewObject(ctx);
+    }
+    out
+}
+
 unsafe extern "C" fn js_worker_ctor(
     ctx: *mut qjs::JSContext,
     new_target: qjs::JSValue,
     argc: c_int,
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
-    if !matches!(
-        worker_threads::runtime_embed(),
-        Some(RuntimeEmbed::Main)
-    ) {
+    if !matches!(worker_threads::runtime_embed(), Some(RuntimeEmbed::Main)) {
         return qjs::JS_ThrowTypeError(
             ctx,
             CString::new("Workers can only be created from the main thread in Kawkab")
@@ -4150,14 +5028,13 @@ unsafe extern "C" fn js_worker_ctor(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(
             ctx,
-            CString::new("Worker requires a script path").unwrap().as_ptr(),
+            CString::new("Worker requires a script path")
+                .unwrap()
+                .as_ptr(),
         );
     }
-    let proto = qjs::JS_GetPropertyStr(
-        ctx,
-        new_target,
-        CString::new("prototype").unwrap().as_ptr(),
-    );
+    let proto =
+        qjs::JS_GetPropertyStr(ctx, new_target, CString::new("prototype").unwrap().as_ptr());
     if is_exception(proto) {
         return proto;
     }
@@ -4197,6 +5074,28 @@ unsafe extern "C" fn js_worker_ctor(
         }
     };
     let _ = install_obj_fn(ctx, obj, "on", Some(js_worker_main_on), 2);
+    let _ = install_obj_fn(ctx, obj, "addListener", Some(js_worker_main_on), 2);
+    let _ = install_obj_fn(ctx, obj, "prependListener", Some(js_worker_main_on), 2);
+    let _ = install_obj_fn(ctx, obj, "once", Some(js_worker_main_once), 2);
+    let _ = install_obj_fn(
+        ctx,
+        obj,
+        "prependOnceListener",
+        Some(js_worker_main_once),
+        2,
+    );
+    let _ = install_obj_fn(ctx, obj, "off", Some(js_worker_main_off), 2);
+    let _ = install_obj_fn(ctx, obj, "removeListener", Some(js_worker_main_off), 2);
+    let _ = install_obj_fn(
+        ctx,
+        obj,
+        "listenerCount",
+        Some(js_worker_main_listener_count),
+        1,
+    );
+    let _ = install_obj_fn(ctx, obj, "listeners", Some(js_worker_main_listeners), 1);
+    let _ = install_obj_fn(ctx, obj, "rawListeners", Some(js_worker_main_listeners), 1);
+    let _ = install_obj_fn(ctx, obj, "eventNames", Some(js_worker_main_event_names), 0);
     let _ = install_obj_fn(
         ctx,
         obj,
@@ -4205,6 +5104,9 @@ unsafe extern "C" fn js_worker_ctor(
         1,
     );
     let _ = install_obj_fn(ctx, obj, "terminate", Some(js_worker_main_terminate), 0);
+    let _ = install_obj_fn(ctx, obj, "ref", Some(js_worker_main_ref), 0);
+    let _ = install_obj_fn(ctx, obj, "unref", Some(js_worker_main_unref), 0);
+    let _ = install_obj_fn(ctx, obj, "hasRef", Some(js_worker_main_has_ref), 0);
     qjs::JS_SetPropertyStr(
         ctx,
         obj,
@@ -4217,6 +5119,43 @@ unsafe extern "C" fn js_worker_ctor(
         CString::new("threadId").unwrap().as_ptr(),
         qjs_compat::new_int(ctx, wid as i64),
     );
+    let options_val = if argc >= 2 { args[1] } else { js_undefined() };
+    let max_old = js_worker_resource_limit_from_options(ctx, options_val, "maxOldGenerationSizeMb");
+    let max_young =
+        js_worker_resource_limit_from_options(ctx, options_val, "maxYoungGenerationSizeMb");
+    let code_range = js_worker_resource_limit_from_options(ctx, options_val, "codeRangeSizeMb");
+    let stack_size = js_worker_resource_limit_from_options(ctx, options_val, "stackSizeMb");
+    let resource_limits = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        resource_limits,
+        CString::new("maxOldGenerationSizeMb").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, max_old),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        resource_limits,
+        CString::new("maxYoungGenerationSizeMb").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, max_young),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        resource_limits,
+        CString::new("codeRangeSizeMb").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, code_range),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        resource_limits,
+        CString::new("stackSizeMb").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, stack_size),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        obj,
+        CString::new("resourceLimits").unwrap().as_ptr(),
+        resource_limits,
+    );
     obj
 }
 
@@ -4227,19 +5166,54 @@ unsafe extern "C" fn js_worker_main_on(
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
     if argc < 2 {
-        return js_undefined();
+        return js_dup_value(this_val);
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
     let ev = js_string_to_owned(ctx, args[0]);
-    if ev != "message" {
-        return js_undefined();
+    if ev == "message" {
+        let wid = match js_worker_read_id(ctx, this_val) {
+            Ok(w) => w,
+            Err(e) => return e,
+        };
+        worker_threads::set_main_worker_message_listener(ctx, wid, args[1], false);
+    } else if ev == "exit" {
+        let wid = match js_worker_read_id(ctx, this_val) {
+            Ok(w) => w,
+            Err(e) => return e,
+        };
+        worker_threads::set_main_worker_exit_listener(ctx, wid, args[1], false);
     }
-    let wid = match js_worker_read_id(ctx, this_val) {
-        Ok(w) => w,
-        Err(e) => return e,
-    };
-    worker_threads::set_main_worker_message_listener(ctx, wid, args[1]);
-    js_undefined()
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_worker_main_once(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return js_dup_value(this_val);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let ev = js_string_to_owned(ctx, args[0]);
+    if ev == "message" {
+        let wid = match js_worker_read_id(ctx, this_val) {
+            Ok(w) => w,
+            Err(e) => return e,
+        };
+        worker_threads::set_main_worker_message_listener(ctx, wid, args[1], true);
+        return js_dup_value(this_val);
+    }
+    if ev == "exit" {
+        let wid = match js_worker_read_id(ctx, this_val) {
+            Ok(w) => w,
+            Err(e) => return e,
+        };
+        worker_threads::set_main_worker_exit_listener(ctx, wid, args[1], true);
+        return js_dup_value(this_val);
+    }
+    js_worker_main_on(ctx, this_val, argc, argv)
 }
 
 unsafe extern "C" fn js_worker_main_post_message(
@@ -4266,6 +5240,35 @@ unsafe extern "C" fn js_worker_main_post_message(
     js_undefined()
 }
 
+unsafe extern "C" fn js_worker_main_off(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return js_dup_value(this_val);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let ev = js_string_to_owned(ctx, args[0]);
+    let target = if argc >= 2 && qjs::JS_IsFunction(ctx, args[1]) != 0 {
+        Some(args[1])
+    } else {
+        None
+    };
+    let wid = match js_worker_read_id(ctx, this_val) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    if ev == "message" {
+        worker_threads::remove_main_worker_message_listener(ctx, wid, target);
+    } else if ev == "exit" {
+        worker_threads::remove_main_worker_exit_listener(ctx, wid, false, target);
+        worker_threads::remove_main_worker_exit_listener(ctx, wid, true, target);
+    }
+    js_dup_value(this_val)
+}
+
 unsafe extern "C" fn js_worker_main_terminate(
     ctx: *mut qjs::JSContext,
     this_val: qjs::JSValue,
@@ -4276,28 +5279,252 @@ unsafe extern "C" fn js_worker_main_terminate(
         Ok(w) => w,
         Err(e) => return e,
     };
-    worker_threads::remove_main_listener(wid, ctx);
     worker_threads::terminate_worker_thread(wid);
-    js_undefined()
+    let _ = worker_threads::dispatch_worker_exit_to_main(ctx, wid, 0);
+    worker_threads::remove_main_listener(wid, ctx);
+    let mut cap = [js_undefined(), js_undefined()];
+    let promise = qjs::JS_NewPromiseCapability(ctx, cap.as_mut_ptr());
+    if is_exception(promise) {
+        return promise;
+    }
+    let exit_code = qjs_compat::new_int(ctx, 0);
+    let mut args = [exit_code];
+    let call_res = qjs::JS_Call(ctx, cap[0], js_undefined(), 1, args.as_mut_ptr());
+    js_free_value(ctx, call_res);
+    js_free_value(ctx, cap[0]);
+    js_free_value(ctx, cap[1]);
+    js_free_value(ctx, exit_code);
+    promise
 }
 
-unsafe extern "C" fn js_worker_nested_disallowed(
+unsafe extern "C" fn js_worker_main_ref(
     ctx: *mut qjs::JSContext,
-    _this: qjs::JSValue,
+    this_val: qjs::JSValue,
     _argc: c_int,
     _argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
-    qjs::JS_ThrowTypeError(
+    let wid = match js_worker_read_id(ctx, this_val) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    worker_threads::main_worker_ref_set(wid, true);
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_worker_main_unref(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let wid = match js_worker_read_id(ctx, this_val) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    worker_threads::main_worker_ref_set(wid, false);
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_worker_main_has_ref(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let wid = match js_worker_read_id(ctx, this_val) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    qjs::JS_NewBool(ctx, worker_threads::main_worker_ref_get(wid))
+}
+
+unsafe extern "C" fn js_worker_main_listener_count(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let wid = match js_worker_read_id(ctx, this_val) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    let ev = if argc >= 1 {
+        let args = std::slice::from_raw_parts(argv, argc as usize);
+        js_string_to_owned(ctx, args[0])
+    } else {
+        String::new()
+    };
+    qjs_compat::new_int(
         ctx,
-        CString::new("nested Workers are not supported in Kawkab yet")
-            .unwrap()
-            .as_ptr(),
+        worker_threads::main_worker_listener_count(wid, &ev) as i64,
     )
+}
+
+unsafe extern "C" fn js_worker_main_event_names(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let wid = match js_worker_read_id(ctx, this_val) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    let out = qjs::JS_NewArray(ctx);
+    let mut idx: u32 = 0;
+    if worker_threads::main_worker_has_message_listener(wid) {
+        let v = qjs_compat::new_string_from_str(ctx, "message");
+        qjs::JS_SetPropertyUint32(ctx, out, idx, v);
+        idx += 1;
+    }
+    if worker_threads::main_worker_has_exit_listener(wid) {
+        let v = qjs_compat::new_string_from_str(ctx, "exit");
+        qjs::JS_SetPropertyUint32(ctx, out, idx, v);
+    }
+    out
+}
+
+unsafe extern "C" fn js_worker_main_listeners(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let wid = match js_worker_read_id(ctx, this_val) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    let ev = if argc >= 1 {
+        let args = std::slice::from_raw_parts(argv, argc as usize);
+        js_string_to_owned(ctx, args[0])
+    } else {
+        String::new()
+    };
+    let out = qjs::JS_NewArray(ctx);
+    let maybe = if ev == "message" {
+        worker_threads::main_worker_get_message_listener(ctx, wid)
+    } else if ev == "exit" {
+        worker_threads::main_worker_get_exit_listener(ctx, wid)
+    } else {
+        None
+    };
+    if let Some(cb) = maybe {
+        qjs::JS_SetPropertyUint32(ctx, out, 0, cb);
+    }
+    out
 }
 
 unsafe extern "C" fn js_parent_port_on(
     ctx: *mut qjs::JSContext,
-    _this: qjs::JSValue,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return js_dup_value(this_val);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let ev = js_string_to_owned(ctx, args[0]);
+    if ev == "message" {
+        worker_threads::set_worker_parent_message_listener(ctx, args[1], false, false);
+    }
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_parent_port_prepend_listener(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return js_dup_value(this_val);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let ev = js_string_to_owned(ctx, args[0]);
+    if ev == "message" {
+        worker_threads::set_worker_parent_message_listener(ctx, args[1], false, true);
+    }
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_parent_port_once(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return js_dup_value(this_val);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let ev = js_string_to_owned(ctx, args[0]);
+    if ev == "message" {
+        worker_threads::set_worker_parent_message_listener(ctx, args[1], true, false);
+    }
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_parent_port_prepend_once(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return js_dup_value(this_val);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let ev = js_string_to_owned(ctx, args[0]);
+    if ev == "message" {
+        worker_threads::set_worker_parent_message_listener(ctx, args[1], true, true);
+    }
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_parent_port_off(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return js_dup_value(this_val);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let ev = js_string_to_owned(ctx, args[0]);
+    let target = if argc >= 2 && qjs::JS_IsFunction(ctx, args[1]) != 0 {
+        Some(args[1])
+    } else {
+        None
+    };
+    if ev == "message" {
+        worker_threads::remove_worker_parent_message_listener(ctx, target);
+    }
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_parent_port_remove_all_listeners(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let ev = if argc >= 1 {
+        let args = std::slice::from_raw_parts(argv, argc as usize);
+        js_string_to_owned(ctx, args[0])
+    } else {
+        String::new()
+    };
+    if ev.is_empty() || ev == "message" {
+        worker_threads::remove_worker_parent_message_listener(ctx, None);
+    }
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_worker_threads_set_environment_data(
+    ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValue,
     argc: c_int,
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
@@ -4305,12 +5532,383 @@ unsafe extern "C" fn js_parent_port_on(
         return js_undefined();
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
-    let ev = js_string_to_owned(ctx, args[0]);
-    if ev != "message" {
+    if let Err(e) = worker_threads::set_worker_environment_data(ctx, args[0], args[1]) {
+        return crate::ffi::throw_type_error(ctx, &e);
+    }
+    js_undefined()
+}
+
+unsafe extern "C" fn js_worker_threads_get_environment_data(
+    ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
         return js_undefined();
     }
-    worker_threads::set_worker_parent_message_listener(ctx, args[1]);
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    match worker_threads::get_worker_environment_data(ctx, args[0]) {
+        Ok(Some(v)) => v,
+        Ok(None) => js_undefined(),
+        Err(e) => crate::ffi::throw_type_error(ctx, &e),
+    }
+}
+
+unsafe extern "C" fn js_worker_threads_receive_message_on_port(
+    ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return js_undefined();
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let port_id = match js_worker_threads_read_port_id(ctx, args[0]) {
+        Some(v) => v,
+        None => return js_undefined(),
+    };
+    match worker_threads::local_port_receive_message(ctx, port_id) {
+        Ok(Some(v)) => {
+            let out = qjs::JS_NewObject(ctx);
+            qjs::JS_SetPropertyStr(ctx, out, CString::new("message").unwrap().as_ptr(), v);
+            out
+        }
+        Ok(None) => js_undefined(),
+        Err(e) => crate::ffi::throw_type_error(ctx, &e),
+    }
+}
+
+unsafe extern "C" fn js_worker_threads_mark_as_untransferable(
+    ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc >= 1 {
+        let args = std::slice::from_raw_parts(argv, argc as usize);
+        if qjs::JS_IsObject(args[0]) {
+            qjs::JS_SetPropertyStr(
+                ctx,
+                args[0],
+                CString::new("__kawkabMarkedUntransferable")
+                    .unwrap()
+                    .as_ptr(),
+                qjs::JS_NewBool(ctx, true),
+            );
+        }
+    }
     js_undefined()
+}
+
+unsafe extern "C" fn js_worker_threads_is_marked_as_untransferable(
+    ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_NewBool(ctx, false);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    if !qjs::JS_IsObject(args[0]) {
+        return qjs::JS_NewBool(ctx, false);
+    }
+    let mark = qjs::JS_GetPropertyStr(
+        ctx,
+        args[0],
+        CString::new("__kawkabMarkedUntransferable")
+            .unwrap()
+            .as_ptr(),
+    );
+    let out = if qjs::JS_IsBool(mark) {
+        qjs::JS_ToBool(ctx, mark) != 0
+    } else {
+        false
+    };
+    js_free_value(ctx, mark);
+    qjs::JS_NewBool(ctx, out)
+}
+
+unsafe extern "C" fn js_worker_threads_move_message_port_to_context(
+    _ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return js_undefined();
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    // Baseline compatibility: return the same port handle/context unchanged.
+    js_dup_value(args[0])
+}
+
+unsafe fn js_worker_threads_read_port_id(
+    ctx: *mut qjs::JSContext,
+    port: qjs::JSValue,
+) -> Option<u64> {
+    if !qjs::JS_IsObject(port) {
+        return None;
+    }
+    let idv = qjs::JS_GetPropertyStr(
+        ctx,
+        port,
+        CString::new("__kawkabWtPortId").unwrap().as_ptr(),
+    );
+    if qjs::JS_IsUndefined(idv) || qjs::JS_IsNull(idv) {
+        js_free_value(ctx, idv);
+        return None;
+    }
+    let mut d: f64 = 0.0;
+    let ok = qjs::JS_ToFloat64(ctx, &mut d as *mut f64, idv) == 0;
+    js_free_value(ctx, idv);
+    if ok {
+        Some(d as u64)
+    } else {
+        None
+    }
+}
+
+unsafe extern "C" fn js_worker_threads_port_post_message(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return js_undefined();
+    }
+    let port_id = match js_worker_threads_read_port_id(ctx, this_val) {
+        Some(v) => v,
+        None => return js_undefined(),
+    };
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    if let Err(e) = worker_threads::local_port_post_message(ctx, port_id, args[0]) {
+        return crate::ffi::throw_type_error(ctx, &e);
+    }
+    js_undefined()
+}
+
+unsafe extern "C" fn js_worker_threads_port_on(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return js_dup_value(this_val);
+    }
+    let port_id = match js_worker_threads_read_port_id(ctx, this_val) {
+        Some(v) => v,
+        None => return js_dup_value(this_val),
+    };
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let ev = js_string_to_owned(ctx, args[0]);
+    if ev == "message" {
+        worker_threads::set_local_port_message_listener(ctx, port_id, args[1]);
+    }
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_worker_threads_port_off(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return js_dup_value(this_val);
+    }
+    let port_id = match js_worker_threads_read_port_id(ctx, this_val) {
+        Some(v) => v,
+        None => return js_dup_value(this_val),
+    };
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let ev = js_string_to_owned(ctx, args[0]);
+    let target = if argc >= 2 && qjs::JS_IsFunction(ctx, args[1]) != 0 {
+        Some(args[1])
+    } else {
+        None
+    };
+    if ev == "message" {
+        worker_threads::remove_local_port_message_listener(ctx, port_id, target);
+    }
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_worker_threads_port_remove_all_listeners(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let Some(port_id) = js_worker_threads_read_port_id(ctx, this_val) else {
+        return js_dup_value(this_val);
+    };
+    let ev = if argc >= 1 {
+        let args = std::slice::from_raw_parts(argv, argc as usize);
+        js_string_to_owned(ctx, args[0])
+    } else {
+        String::new()
+    };
+    if ev.is_empty() || ev == "message" {
+        worker_threads::remove_local_port_message_listener(ctx, port_id, None);
+    }
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_worker_threads_port_start(
+    _ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    js_undefined()
+}
+
+unsafe extern "C" fn js_worker_threads_port_close(
+    _ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    js_undefined()
+}
+
+unsafe extern "C" fn js_worker_threads_port_ref(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if let Some(port_id) = js_worker_threads_read_port_id(ctx, this_val) {
+        let _ = worker_threads::set_local_port_has_ref(port_id, true);
+    }
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_worker_threads_port_unref(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if let Some(port_id) = js_worker_threads_read_port_id(ctx, this_val) {
+        let _ = worker_threads::set_local_port_has_ref(port_id, false);
+    }
+    js_dup_value(this_val)
+}
+
+unsafe extern "C" fn js_worker_threads_port_has_ref(
+    ctx: *mut qjs::JSContext,
+    this_val: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let out = js_worker_threads_read_port_id(ctx, this_val)
+        .and_then(|port_id| worker_threads::local_port_has_ref(port_id).ok())
+        .unwrap_or(true);
+    qjs::JS_NewBool(ctx, out)
+}
+
+unsafe fn js_worker_threads_new_port(ctx: *mut qjs::JSContext, port_id: u64) -> qjs::JSValue {
+    let port = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(
+        ctx,
+        port,
+        "postMessage",
+        Some(js_worker_threads_port_post_message),
+        1,
+    );
+    let _ = install_obj_fn(ctx, port, "on", Some(js_worker_threads_port_on), 2);
+    let _ = install_obj_fn(ctx, port, "addListener", Some(js_worker_threads_port_on), 2);
+    let _ = install_obj_fn(ctx, port, "off", Some(js_worker_threads_port_off), 2);
+    let _ = install_obj_fn(
+        ctx,
+        port,
+        "removeListener",
+        Some(js_worker_threads_port_off),
+        2,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        port,
+        "removeAllListeners",
+        Some(js_worker_threads_port_remove_all_listeners),
+        1,
+    );
+    let _ = install_obj_fn(ctx, port, "start", Some(js_worker_threads_port_start), 0);
+    let _ = install_obj_fn(ctx, port, "close", Some(js_worker_threads_port_close), 0);
+    let _ = install_obj_fn(ctx, port, "ref", Some(js_worker_threads_port_ref), 0);
+    let _ = install_obj_fn(ctx, port, "unref", Some(js_worker_threads_port_unref), 0);
+    let _ = install_obj_fn(ctx, port, "hasRef", Some(js_worker_threads_port_has_ref), 0);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        port,
+        CString::new("__kawkabWtPortId").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, port_id as i64),
+    );
+    port
+}
+
+unsafe extern "C" fn js_worker_threads_message_channel(
+    ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let (p1, p2) = match worker_threads::create_local_message_channel_pair() {
+        Ok(v) => v,
+        Err(e) => return crate::ffi::throw_type_error(ctx, &e),
+    };
+    let out = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        out,
+        CString::new("port1").unwrap().as_ptr(),
+        js_worker_threads_new_port(ctx, p1),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        out,
+        CString::new("port2").unwrap().as_ptr(),
+        js_worker_threads_new_port(ctx, p2),
+    );
+    out
+}
+
+unsafe extern "C" fn js_parent_port_listener_count(
+    ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let ev = if argc >= 1 {
+        let args = std::slice::from_raw_parts(argv, argc as usize);
+        js_string_to_owned(ctx, args[0])
+    } else {
+        String::new()
+    };
+    qjs_compat::new_int(
+        ctx,
+        worker_threads::worker_parent_listener_count(&ev) as i64,
+    )
+}
+
+unsafe extern "C" fn js_parent_port_event_names(
+    ctx: *mut qjs::JSContext,
+    _this_val: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let out = qjs::JS_NewArray(ctx);
+    if worker_threads::worker_parent_has_message_listener() {
+        let v = qjs_compat::new_string_from_str(ctx, "message");
+        qjs::JS_SetPropertyUint32(ctx, out, 0, v);
+    }
+    out
 }
 
 unsafe extern "C" fn js_parent_port_post_message(
@@ -5613,15 +7211,87 @@ unsafe extern "C" fn js_process_next_tick(
                 .as_ptr(),
         );
     }
-    if qjs::JS_EnqueueJob(ctx, Some(js_enqueue_js_call_job), argc, argv) != 0 {
+    let mut copied = Vec::with_capacity((argc as usize).saturating_sub(1));
+    for v in args.iter().skip(1) {
+        copied.push(js_dup_value(*v));
+    }
+    NEXT_TICK_QUEUE.with(|q| {
+        q.borrow_mut().push_back(PendingJsCall {
+            callback: js_dup_value(cb),
+            args: copied,
+        });
+    });
+    js_undefined()
+}
+
+pub(crate) unsafe fn drain_next_tick_queue(ctx: *mut qjs::JSContext) -> Result<bool, String> {
+    let mut had_work = false;
+    loop {
+        let next = NEXT_TICK_QUEUE.with(|q| q.borrow_mut().pop_front());
+        let Some(call) = next else {
+            break;
+        };
+        had_work = true;
+        let mut argv = call.args;
+        let ret = if argv.is_empty() {
+            qjs::JS_Call(ctx, call.callback, js_undefined(), 0, std::ptr::null_mut())
+        } else {
+            qjs::JS_Call(
+                ctx,
+                call.callback,
+                js_undefined(),
+                argv.len() as c_int,
+                argv.as_mut_ptr(),
+            )
+        };
+        for v in argv {
+            js_free_value(ctx, v);
+        }
+        js_free_value(ctx, call.callback);
+        if is_exception(ret) {
+            let exc = qjs::JS_GetException(ctx);
+            let detail = crate::ffi::js_string_to_owned(ctx, exc);
+            js_free_value(ctx, exc);
+            js_free_value(ctx, ret);
+            return Err(format!("process.nextTick callback failed: {detail}"));
+        }
+        js_free_value(ctx, ret);
+    }
+    Ok(had_work)
+}
+
+unsafe extern "C" fn js_set_immediate(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
         return qjs::JS_ThrowTypeError(
             ctx,
-            CString::new("process.nextTick: failed to enqueue job")
+            CString::new("setImmediate(callback, ...args) requires callback")
                 .unwrap()
                 .as_ptr(),
         );
     }
-    js_undefined()
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    if qjs::JS_IsFunction(ctx, args[0]) == 0 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("setImmediate callback must be a function")
+                .unwrap()
+                .as_ptr(),
+        );
+    }
+    if qjs::JS_EnqueueJob(ctx, Some(js_enqueue_js_call_job), argc, argv) != 0 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("setImmediate: failed to enqueue job")
+                .unwrap()
+                .as_ptr(),
+        );
+    }
+    qjs_compat::new_int(ctx, 1)
 }
 
 /// `timers/promises`: deferred timer path like `setTimeout`, but resolves a Promise.
@@ -6582,31 +8252,49 @@ unsafe extern "C" fn js_http_client_get(
         );
     }
     let cb = args[1];
-    let client = http_blocking_client();
-    let resp = match client.get(&url).send() {
-        Ok(r) => r,
-        Err(e) => {
-            return crate::ffi::throw_type_error(ctx, &format!("http.get: request failed: {e}"));
+    let fetch_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let client = http_blocking_client();
+        let resp = client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("http.get: request failed: {e}"))?;
+        let status = resp.status().as_u16();
+        let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+        let mut hdr_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (name, value) in resp.headers().iter() {
+            let k = name.as_str().to_ascii_lowercase();
+            let v = value.to_str().unwrap_or("");
+            hdr_map
+                .entry(k)
+                .and_modify(|e| {
+                    e.push_str(", ");
+                    e.push_str(v);
+                })
+                .or_insert_with(|| v.to_string());
         }
-    };
-    let status = resp.status().as_u16();
-    let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
-    let mut hdr_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for (name, value) in resp.headers().iter() {
-        let k = name.as_str().to_ascii_lowercase();
-        let v = value.to_str().unwrap_or("");
-        hdr_map
-            .entry(k)
-            .and_modify(|e| {
-                e.push_str(", ");
-                e.push_str(v);
-            })
-            .or_insert_with(|| v.to_string());
-    }
-    let body = match resp.bytes() {
-        Ok(b) => b.to_vec(),
-        Err(e) => {
-            return crate::ffi::throw_type_error(ctx, &format!("http.get: read body: {e}"));
+        let body = resp
+            .bytes()
+            .map_err(|e| format!("http.get: read body: {e}"))?
+            .to_vec();
+        Ok::<
+            (
+                u16,
+                String,
+                std::collections::HashMap<String, String>,
+                Vec<u8>,
+            ),
+            String,
+        >((status, status_text, hdr_map, body))
+    }));
+    let (status, status_text, hdr_map, body) = match fetch_res {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return crate::ffi::throw_type_error(ctx, &e),
+        Err(_) => {
+            return crate::ffi::throw_type_error(
+                ctx,
+                "http.get internal panic (likely blocking runtime interaction)",
+            );
         }
     };
     let res_obj = build_http_client_response_object(ctx, status, &status_text, &hdr_map, body);
@@ -7501,6 +9189,14 @@ unsafe extern "C" fn js_require(
     if request == "events" {
         return require_primmed_or_eval(ctx, "__kawkabPrimedEvents", "events", EVENTS_SHIM_SRC);
     }
+    if request == "async_hooks" {
+        return require_primmed_or_eval(
+            ctx,
+            "__kawkabPrimedAsyncHooks",
+            "async_hooks",
+            ASYNC_HOOKS_SHIM_SRC,
+        );
+    }
     if request == "util" || request == "sys" {
         let obj = qjs::JS_NewObject(ctx);
         let inspect = qjs::JS_NewCFunction2(
@@ -7512,6 +9208,15 @@ unsafe extern "C" fn js_require(
             0,
         );
         qjs::JS_SetPropertyStr(ctx, obj, CString::new("inspect").unwrap().as_ptr(), inspect);
+        let g_inh = qjs::JS_GetGlobalObject(ctx);
+        let inh_k = CString::new("__kawkabUtilInherits").unwrap();
+        let inh = qjs::JS_GetPropertyStr(ctx, g_inh, inh_k.as_ptr());
+        js_free_value(ctx, g_inh);
+        if !qjs::JS_IsUndefined(inh) && qjs::JS_IsFunction(ctx, inh) != 0 {
+            let dup = js_dup_value(inh);
+            qjs::JS_SetPropertyStr(ctx, obj, CString::new("inherits").unwrap().as_ptr(), dup);
+        }
+        js_free_value(ctx, inh);
         let types = qjs::JS_NewObject(ctx);
         let is_date = qjs::JS_NewCFunction2(
             ctx,
@@ -7820,6 +9525,17 @@ unsafe extern "C" fn js_require(
             READLINE_SHIM_SRC,
         );
     }
+    if request == "readline/promises" {
+        return require_primmed_or_eval(
+            ctx,
+            "__kawkabPrimedReadlinePromises",
+            "readline-promises",
+            READLINE_PROMISES_SHIM_SRC,
+        );
+    }
+    if request == "tty" || request == "node:tty" {
+        return require_primmed_or_eval(ctx, "__kawkabPrimedTty", "tty", TTY_SHIM_SRC);
+    }
     if request == "zlib" {
         let obj = qjs::JS_NewObject(ctx);
         let _ = install_obj_fn(ctx, obj, "gzipSync", Some(js_zlib_gzip_sync), 1);
@@ -7829,45 +9545,141 @@ unsafe extern "C" fn js_require(
         return obj;
     }
     if request == "tls" {
-        let obj = qjs::JS_NewObject(ctx);
-        let _ = install_obj_fn(ctx, obj, "connect", Some(js_noop), 0);
-        let _ = install_obj_fn(ctx, obj, "createServer", Some(js_noop), 0);
-        return obj;
+        return require_primmed_or_eval(ctx, "__kawkabPrimedTls", "tls", TLS_SHIM_SRC);
     }
     if request == "vm" {
+        return require_primmed_or_eval(ctx, "__kawkabPrimedVm", "vm", VM_SHIM_SRC);
+    }
+    if request == "worker_threads" {
         let obj = qjs::JS_NewObject(ctx);
+        let global = qjs::JS_GetGlobalObject(ctx);
+        let bc = qjs::JS_GetPropertyStr(
+            ctx,
+            global,
+            CString::new("BroadcastChannel").unwrap().as_ptr(),
+        );
+        js_free_value(ctx, global);
+        if !qjs::JS_IsUndefined(bc) {
+            qjs::JS_SetPropertyStr(
+                ctx,
+                obj,
+                CString::new("BroadcastChannel").unwrap().as_ptr(),
+                bc,
+            );
+        } else {
+            js_free_value(ctx, bc);
+        }
+        qjs::JS_SetPropertyStr(
+            ctx,
+            obj,
+            CString::new("SHARE_ENV").unwrap().as_ptr(),
+            js_worker_threads_share_env_value(ctx),
+        );
         let _ = install_obj_fn(
             ctx,
             obj,
-            "runInThisContext",
-            Some(js_vm_run_in_this_context),
+            "MessageChannel",
+            Some(js_worker_threads_message_channel),
+            0,
+        );
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "setEnvironmentData",
+            Some(js_worker_threads_set_environment_data),
+            2,
+        );
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "getEnvironmentData",
+            Some(js_worker_threads_get_environment_data),
             1,
         );
         let _ = install_obj_fn(
             ctx,
             obj,
-            "runInNewContext",
-            Some(js_vm_run_in_new_context),
+            "receiveMessageOnPort",
+            Some(js_worker_threads_receive_message_on_port),
+            1,
+        );
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "markAsUntransferable",
+            Some(js_worker_threads_mark_as_untransferable),
+            1,
+        );
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "isMarkedAsUntransferable",
+            Some(js_worker_threads_is_marked_as_untransferable),
+            1,
+        );
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "moveMessagePortToContext",
+            Some(js_worker_threads_move_message_port_to_context),
             2,
         );
-        let _ = install_obj_fn(ctx, obj, "Script", Some(js_return_empty_object), 1);
-        let _ = install_obj_fn(ctx, obj, "createContext", Some(js_return_empty_object), 1);
-        let _ = install_obj_fn(ctx, obj, "isContext", Some(js_noop), 1);
-        return obj;
-    }
-    if request == "worker_threads" {
-        let obj = qjs::JS_NewObject(ctx);
-        let _ = install_obj_fn(ctx, obj, "MessageChannel", Some(js_return_empty_object), 0);
         match worker_threads::runtime_embed() {
-            Some(RuntimeEmbed::Worker { .. }) => {
+            Some(RuntimeEmbed::Worker { worker_id, .. }) => {
                 qjs::JS_SetPropertyStr(
                     ctx,
                     obj,
                     CString::new("isMainThread").unwrap().as_ptr(),
                     qjs::JS_NewBool(ctx, false),
                 );
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    obj,
+                    CString::new("isInternalThread").unwrap().as_ptr(),
+                    qjs::JS_NewBool(ctx, false),
+                );
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    obj,
+                    CString::new("threadId").unwrap().as_ptr(),
+                    qjs_compat::new_int(ctx, worker_id as i64),
+                );
                 let port = qjs::JS_NewObject(ctx);
                 let _ = install_obj_fn(ctx, port, "on", Some(js_parent_port_on), 2);
+                let _ = install_obj_fn(ctx, port, "addListener", Some(js_parent_port_on), 2);
+                let _ = install_obj_fn(
+                    ctx,
+                    port,
+                    "prependListener",
+                    Some(js_parent_port_prepend_listener),
+                    2,
+                );
+                let _ = install_obj_fn(ctx, port, "once", Some(js_parent_port_once), 2);
+                let _ = install_obj_fn(
+                    ctx,
+                    port,
+                    "prependOnceListener",
+                    Some(js_parent_port_prepend_once),
+                    2,
+                );
+                let _ = install_obj_fn(ctx, port, "off", Some(js_parent_port_off), 2);
+                let _ = install_obj_fn(ctx, port, "removeListener", Some(js_parent_port_off), 2);
+                let _ = install_obj_fn(
+                    ctx,
+                    port,
+                    "removeAllListeners",
+                    Some(js_parent_port_remove_all_listeners),
+                    1,
+                );
+                let _ = install_obj_fn(
+                    ctx,
+                    port,
+                    "listenerCount",
+                    Some(js_parent_port_listener_count),
+                    1,
+                );
+                let _ =
+                    install_obj_fn(ctx, port, "eventNames", Some(js_parent_port_event_names), 0);
                 let _ = install_obj_fn(
                     ctx,
                     port,
@@ -7881,23 +9693,7 @@ unsafe extern "C" fn js_require(
                     CString::new("parentPort").unwrap().as_ptr(),
                     port,
                 );
-                let bad_ctor = qjs::JS_NewCFunction2(
-                    ctx,
-                    Some(js_worker_nested_disallowed),
-                    CString::new("Worker").unwrap().as_ptr(),
-                    1,
-                    qjs::JSCFunctionEnum_JS_CFUNC_constructor,
-                    0,
-                );
-                qjs::JS_SetPropertyStr(
-                    ctx,
-                    obj,
-                    CString::new("Worker").unwrap().as_ptr(),
-                    bad_ctor,
-                );
-            }
-            _ => {
-                let ctor = qjs::JS_NewCFunction2(
+                let nested_ctor = qjs::JS_NewCFunction2(
                     ctx,
                     Some(js_worker_ctor),
                     CString::new("Worker").unwrap().as_ptr(),
@@ -7909,8 +9705,19 @@ unsafe extern "C" fn js_require(
                     ctx,
                     obj,
                     CString::new("Worker").unwrap().as_ptr(),
-                    ctor,
+                    nested_ctor,
                 );
+            }
+            _ => {
+                let ctor = qjs::JS_NewCFunction2(
+                    ctx,
+                    Some(js_worker_ctor),
+                    CString::new("Worker").unwrap().as_ptr(),
+                    2,
+                    qjs::JSCFunctionEnum_JS_CFUNC_constructor,
+                    0,
+                );
+                qjs::JS_SetPropertyStr(ctx, obj, CString::new("Worker").unwrap().as_ptr(), ctor);
                 qjs::JS_SetPropertyStr(
                     ctx,
                     obj,
@@ -7920,8 +9727,20 @@ unsafe extern "C" fn js_require(
                 qjs::JS_SetPropertyStr(
                     ctx,
                     obj,
+                    CString::new("isInternalThread").unwrap().as_ptr(),
+                    qjs::JS_NewBool(ctx, false),
+                );
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    obj,
+                    CString::new("threadId").unwrap().as_ptr(),
+                    qjs_compat::new_int(ctx, 0),
+                );
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    obj,
                     CString::new("parentPort").unwrap().as_ptr(),
-                    js_undefined(),
+                    js_null(),
                 );
             }
         }
@@ -7933,7 +9752,7 @@ unsafe extern "C" fn js_require(
         let _ = install_c_fn(ctx, obj, "clearTimeout", Some(js_clear_timeout), 1);
         let _ = install_c_fn(ctx, obj, "setInterval", Some(js_set_interval), 2);
         let _ = install_c_fn(ctx, obj, "clearInterval", Some(js_clear_timeout), 1);
-        let _ = install_c_fn(ctx, obj, "setImmediate", Some(js_set_timeout), 1);
+        let _ = install_c_fn(ctx, obj, "setImmediate", Some(js_set_immediate), 1);
         let _ = install_c_fn(ctx, obj, "clearImmediate", Some(js_clear_timeout), 1);
         return obj;
     }
@@ -7957,50 +9776,54 @@ unsafe extern "C" fn js_require(
     }
     if request == "perf_hooks" {
         let global = qjs::JS_GetGlobalObject(ctx);
-        let perf =
-            qjs::JS_GetPropertyStr(ctx, global, CString::new("performance").unwrap().as_ptr());
         let obj = qjs::JS_NewObject(ctx);
-        qjs::JS_SetPropertyStr(
-            ctx,
-            obj,
-            CString::new("performance").unwrap().as_ptr(),
-            js_dup_value(perf),
-        );
-        js_free_value(ctx, perf);
-        let helpers = eval_js_module(ctx, "perf-hooks-helpers", PERF_HOOKS_HELPERS_SRC);
-        if is_exception(helpers) {
-            let exc = qjs::JS_GetException(ctx);
-            let detail = crate::ffi::js_string_to_owned(ctx, exc);
-            js_free_value(ctx, exc);
-            js_free_value(ctx, helpers);
+        let perf_key = CString::new("performance").unwrap();
+        let perf = qjs::JS_GetPropertyStr(ctx, global, perf_key.as_ptr());
+        if qjs::JS_IsUndefined(perf) {
+            js_free_value(ctx, perf);
             js_free_value(ctx, obj);
             js_free_value(ctx, global);
             return qjs::JS_ThrowInternalError(
                 ctx,
-                CString::new(format!("perf_hooks helpers: {detail}"))
-                    .unwrap_or_default()
+                CString::new("perf_hooks: global performance is missing")
+                    .unwrap()
                     .as_ptr(),
             );
         }
+        qjs::JS_SetPropertyStr(ctx, obj, perf_key.as_ptr(), js_dup_value(perf));
+        js_free_value(ctx, perf);
         for key in [
             "PerformanceObserver",
+            "PerformanceResourceTiming",
             "PerformanceEntry",
             "PerformanceMark",
             "PerformanceMeasure",
-            "PerformanceResourceTiming",
             "PerformanceObserverEntryList",
-            "constants",
-            "nodeTiming",
         ] {
             let c = CString::new(key).unwrap();
-            let v = qjs::JS_GetPropertyStr(ctx, helpers, c.as_ptr());
-            if !qjs::JS_IsUndefined(v) {
-                qjs::JS_SetPropertyStr(ctx, obj, c.as_ptr(), v);
-            } else {
+            let v = qjs::JS_GetPropertyStr(ctx, global, c.as_ptr());
+            if qjs::JS_IsUndefined(v) {
                 js_free_value(ctx, v);
+                js_free_value(ctx, obj);
+                js_free_value(ctx, global);
+                return qjs::JS_ThrowInternalError(
+                    ctx,
+                    CString::new(format!("perf_hooks: global {key} is missing"))
+                        .unwrap_or_default()
+                        .as_ptr(),
+                );
             }
+            qjs::JS_SetPropertyStr(ctx, obj, c.as_ptr(), js_dup_value(v));
+            js_free_value(ctx, v);
         }
-        js_free_value(ctx, helpers);
+        let constants = qjs::JS_NewObject(ctx);
+        let gc_dur = CString::new("NODE_PERFORMANCE_GC_DURATION").unwrap();
+        qjs::JS_SetPropertyStr(ctx, constants, gc_dur.as_ptr(), qjs_compat::new_int(ctx, 0));
+        let ckey = CString::new("constants").unwrap();
+        qjs::JS_SetPropertyStr(ctx, obj, ckey.as_ptr(), constants);
+        let node_timing = qjs::JS_NewObject(ctx);
+        let ntkey = CString::new("nodeTiming").unwrap();
+        qjs::JS_SetPropertyStr(ctx, obj, ntkey.as_ptr(), node_timing);
         js_free_value(ctx, global);
         return obj;
     }
@@ -8018,6 +9841,134 @@ unsafe extern "C" fn js_require(
     if request == "module" {
         let obj = qjs::JS_NewObject(ctx);
         let _ = install_obj_fn(ctx, obj, "createRequire", Some(js_module_create_require), 1);
+        return obj;
+    }
+    if request == "tty" || request == "node:tty" {
+        return require_primmed_or_eval(ctx, "__kawkabPrimedTty", "tty", TTY_SHIM_SRC);
+    }
+    if request == "domain" || request == "node:domain" {
+        let obj = qjs::JS_NewObject(ctx);
+        let _ = install_obj_fn(ctx, obj, "create", Some(js_domain_create), 0);
+        let _ = install_obj_fn(ctx, obj, "createDomain", Some(js_domain_create), 0);
+        let domain_ctor = qjs::JS_NewCFunction2(
+            ctx,
+            Some(js_domain_create),
+            CString::new("Domain").unwrap().as_ptr(),
+            0,
+            qjs::JSCFunctionEnum_JS_CFUNC_constructor,
+            0,
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            obj,
+            CString::new("Domain").unwrap().as_ptr(),
+            domain_ctor,
+        );
+        return obj;
+    }
+    if request == "repl" || request == "node:repl" {
+        let obj = qjs::JS_NewObject(ctx);
+        let _ = install_obj_fn(ctx, obj, "start", Some(js_repl_start), 1);
+        return obj;
+    }
+    if request == "trace_events" || request == "node:trace_events" {
+        let obj = qjs::JS_NewObject(ctx);
+        let _ = install_obj_fn(ctx, obj, "createTracing", Some(js_trace_create_tracing), 1);
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "getEnabledCategories",
+            Some(js_trace_get_enabled_categories),
+            0,
+        );
+        return obj;
+    }
+    if request == "inspector" || request == "node:inspector" {
+        let obj = qjs::JS_NewObject(ctx);
+        let _ = install_obj_fn(ctx, obj, "open", Some(js_inspector_open), 3);
+        let _ = install_obj_fn(ctx, obj, "close", Some(js_return_true), 0);
+        let _ = install_obj_fn(ctx, obj, "url", Some(js_return_empty_string), 0);
+        return obj;
+    }
+    if request == "v8" || request == "node:v8" {
+        let obj = qjs::JS_NewObject(ctx);
+        let _ = install_obj_fn(ctx, obj, "cachedDataVersionTag", Some(js_return_one_int), 0);
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "getHeapStatistics",
+            Some(js_v8_heap_statistics),
+            0,
+        );
+        let _ = install_obj_fn(ctx, obj, "setFlagsFromString", Some(js_noop), 1);
+        return obj;
+    }
+    if request == "wasi" || request == "node:wasi" {
+        let obj = qjs::JS_NewObject(ctx);
+        let wasi_ctor = qjs::JS_NewCFunction2(
+            ctx,
+            Some(js_wasi_ctor),
+            CString::new("WASI").unwrap().as_ptr(),
+            1,
+            qjs::JSCFunctionEnum_JS_CFUNC_constructor,
+            0,
+        );
+        qjs::JS_SetPropertyStr(ctx, obj, CString::new("WASI").unwrap().as_ptr(), wasi_ctor);
+        return obj;
+    }
+    if request == "cluster" || request == "node:cluster" {
+        let obj = qjs::JS_NewObject(ctx);
+        qjs::JS_SetPropertyStr(
+            ctx,
+            obj,
+            CString::new("isMaster").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, true),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            obj,
+            CString::new("isPrimary").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, true),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            obj,
+            CString::new("isWorker").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, false),
+        );
+        let _ = install_obj_fn(ctx, obj, "fork", Some(js_cluster_fork), 1);
+        let _ = install_obj_fn(ctx, obj, "setupPrimary", Some(js_cluster_setup_primary), 1);
+        return obj;
+    }
+    if request == "http2" || request == "node:http2" {
+        let obj = qjs::JS_NewObject(ctx);
+        let _ = install_obj_fn(ctx, obj, "createServer", Some(js_http2_server_like), 1);
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "createSecureServer",
+            Some(js_http2_server_like),
+            1,
+        );
+        let _ = install_obj_fn(ctx, obj, "connect", Some(js_http2_client_like), 2);
+        return obj;
+    }
+    if request == "sqlite" || request == "node:sqlite" {
+        let obj = qjs::JS_NewObject(ctx);
+        let db_ctor = qjs::JS_NewCFunction2(
+            ctx,
+            Some(js_sqlite_database_ctor),
+            CString::new("Database").unwrap().as_ptr(),
+            1,
+            qjs::JSCFunctionEnum_JS_CFUNC_constructor,
+            0,
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            obj,
+            CString::new("Database").unwrap().as_ptr(),
+            db_ctor,
+        );
         return obj;
     }
     refresh_package_exports_node_env(ctx);
@@ -8094,13 +10045,16 @@ unsafe extern "C" fn js_require(
     };
     let wrapper_start = "(function(exports, require, module, __filename, __dirname) {\n";
     let wrapper_end = "\n});";
-    let wrapped_source = format!("{}{}{}", wrapper_start, source, wrapper_end);
+    let source = module_loader::sanitize_cjs_body_for_quickjs_block_comment_openers(&source);
+    let wrapped_source = format!("{}{}{}", wrapper_start, source.as_ref(), wrapper_end);
 
+    let eval_filename = module_loader::quickjs_eval_filename_for_path(&resolved);
+    let c_eval_filename = CString::new(eval_filename).unwrap_or_default();
     let func_val = qjs_compat::eval(
         ctx,
         wrapped_source.as_ptr() as *const i8,
         wrapped_source.len(),
-        CString::new(resolved.clone()).unwrap().as_ptr(),
+        c_eval_filename.as_ptr(),
         qjs::JS_EVAL_TYPE_GLOBAL as i32,
     );
 
@@ -8712,8 +10666,10 @@ fn os_free_memory_bytes() -> u64 {
     if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
         for line in s.lines() {
             if line.starts_with("MemAvailable:") {
-                if let Some(kb) =
-                    line.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok())
+                if let Some(kb) = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|x| x.parse::<u64>().ok())
                 {
                     return kb.saturating_mul(1024);
                 }
@@ -8820,12 +10776,7 @@ unsafe extern "C" fn js_os_cpus(
         let _ = set_str_prop(ctx, times, "sys", "0");
         let _ = set_str_prop(ctx, times, "idle", "0");
         let _ = set_str_prop(ctx, times, "irq", "0");
-        qjs::JS_SetPropertyStr(
-            ctx,
-            o,
-            CString::new("times").unwrap().as_ptr(),
-            times,
-        );
+        qjs::JS_SetPropertyStr(ctx, o, CString::new("times").unwrap().as_ptr(), times);
         qjs::JS_SetPropertyUint32(ctx, arr, i as u32, o);
     }
     arr
@@ -9091,11 +11042,7 @@ unsafe extern "C" fn js_util_types_is_buffer(
         js_free_value(ctx, buf_ctor);
         return qjs::JS_NewBool(ctx, false);
     }
-    let is_buf = qjs::JS_GetPropertyStr(
-        ctx,
-        buf_ctor,
-        CString::new("isBuffer").unwrap().as_ptr(),
-    );
+    let is_buf = qjs::JS_GetPropertyStr(ctx, buf_ctor, CString::new("isBuffer").unwrap().as_ptr());
     js_free_value(ctx, buf_ctor);
     if qjs::JS_IsFunction(ctx, is_buf) == 0 {
         js_free_value(ctx, is_buf);
@@ -10184,7 +12131,11 @@ fn http_listen_join_host_port(host: &str, port: u16) -> String {
     }
 }
 
-unsafe fn http_server_apply_bound_socket(ctx: *mut qjs::JSContext, server: qjs::JSValue, sa: SocketAddr) {
+unsafe fn http_server_apply_bound_socket(
+    ctx: *mut qjs::JSContext,
+    server: qjs::JSValue,
+    sa: SocketAddr,
+) {
     let (addr_s, fam_s, port_u) = match sa {
         SocketAddr::V4(v4) => (v4.ip().to_string(), "IPv4", v4.port()),
         SocketAddr::V6(v6) => (v6.ip().to_string(), "IPv6", v6.port()),

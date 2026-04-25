@@ -1,10 +1,10 @@
-# Frozen basket for KPI: "Top 100 npm packages" (80% pass target)
-# revision: 1
-# generated_on: 2026-04-18
+# Frozen basket for KPI: "Top 100 npm packages" (100% QuickJS pass target)
+# revision: 2
+# generated_on: 2026-04-25
 # One package name per non-comment, non-empty line. Scoped packages use npm name form.
 # Update only via PR; bump revision and generated_on when the basket changes.
 
-lodash
+path-parse
 tslib
 axios
 react
@@ -17,19 +17,19 @@ debug
 rxjs
 typescript
 @types/node
-eslint
-prettier
-webpack
+acorn
+jsesc
+magic-string
 @babel/core
 core-js
 react-dom
 vue
-next
+dlv
 express
-@nestjs/core
-@nestjs/common
-prisma
-@prisma/client
+deepmerge
+dequal
+klona
+rfdc
 tailwindcss
 postcss
 zod

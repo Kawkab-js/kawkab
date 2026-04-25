@@ -31,7 +31,7 @@ struct LoadedSource {
 }
 
 /// Version bump invalidates on-disk bytecode when cache key scheme changes.
-const TS_CACHE_SALT: &str = "kawkab-bytecode-v10";
+const TS_CACHE_SALT: &str = "kawkab-bytecode-v12";
 
 fn append_exec_fingerprint(key_material: &mut Vec<u8>, exec_src: &[u8]) {
     key_material.extend_from_slice(b":exec:");
@@ -284,9 +284,7 @@ fn parse_pm_command(args: &[String]) -> anyhow::Result<Option<pm::PmCommand>> {
                         anyhow::bail!("unknown flag for kawkab init: {other}");
                     }
                     _ => {
-                        anyhow::bail!(
-                            "usage: kawkab init [--yes|-y] [--force] [--entry <file>]"
-                        );
+                        anyhow::bail!("usage: kawkab init [--yes|-y] [--force] [--entry <file>]");
                     }
                 }
             }
@@ -346,6 +344,23 @@ fn run_with_quickjs(
     result
 }
 
+/// QuickJS uses the `filename` argument to `JS_Eval` in internal sourceURL / line
+/// annotations. Some absolute paths (e.g. containing a `/projects/` segment) are
+/// mis-tokenized and break parsing (`SyntaxError: unexpected end of regexp`). The
+/// real path remains on `__filename` / disk bytecode keys via [`install_runtime`];
+/// this value is **only** the eval display name.
+fn quickjs_source_name_for_eval(canonical_file_path: &str) -> String {
+    let digest = blake3::hash(canonical_file_path.as_bytes());
+    let prefix = digest.as_bytes();
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(16);
+    for &b in &prefix[..8] {
+        hex.push(char::from(DIGITS[(b >> 4) as usize]));
+        hex.push(char::from(DIGITS[(b & 0xf) as usize]));
+    }
+    format!("kawkab-entry-{hex}.js")
+}
+
 async fn run_quickjs_inner(
     loaded: &LoadedSource,
     filename: &str,
@@ -366,6 +381,7 @@ async fn run_quickjs_inner(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| filename.to_string());
     let filename = &filename_abs;
+    let qjs_eval_filename = quickjs_source_name_for_eval(filename);
 
     let _rt_handle = tokio::runtime::Handle::current();
     let (task_tx, mut task_rx) =
@@ -378,7 +394,7 @@ async fn run_quickjs_inner(
     }
 
     let eval_val = if loaded.is_esm {
-        match unsafe { kawkab_core::node::eval_esm_entry(ctx, filename) } {
+        match unsafe { kawkab_core::node::eval_esm_entry(ctx, filename, &qjs_eval_filename) } {
             Ok(v) => v,
             Err(e) => {
                 if allow_node_fallback {
@@ -399,6 +415,7 @@ async fn run_quickjs_inner(
             &loaded.exec_src,
             &loaded.cache_material,
             filename,
+            &qjs_eval_filename,
             verbose,
         )
         .with_context(|| format!("failed to run {filename}"))?;
@@ -499,20 +516,32 @@ fn eval_with_bytecode_cache(
     ctx: *mut qjs::JSContext,
     exec_src: &[u8],
     cache_material: &[u8],
-    filename: &str,
+    disk_cache_path: &str,
+    qjs_eval_filename: &str,
     verbose: bool,
 ) -> anyhow::Result<qjs::JSValue> {
-    let skip_disk = std::env::var("KAWKAB_SKIP_BYTECODE")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    use std::ffi::CString;
+
+    // Disk bytecode cache is currently unstable under some QuickJS embedding paths.
+    // Keep runtime deterministic by default; allow explicit opt-in.
+    let skip_disk = std::env::var("KAWKAB_ENABLE_BYTECODE_DISK")
+        .map(|v| v != "1")
+        .unwrap_or(true);
 
     if !skip_disk {
         let cache_dir = bytecode_cache_dir();
         let disk = kawkab_core::bytecode::DiskCache::new(&cache_dir)
             .with_context(|| format!("failed to init bytecode cache at {}", cache_dir.display()))?;
 
-        let canonical = canonical_for_key(filename);
-        let key = kawkab_core::bytecode::DiskCache::cache_key(&canonical, cache_material);
+        let canonical = canonical_for_key(disk_cache_path);
+        // Bytecode embeds compile-time filename metadata; include eval filename in cache key
+        // to avoid reusing stale entries across filename strategy changes.
+        let mut key_material =
+            Vec::with_capacity(cache_material.len() + qjs_eval_filename.len() + 8);
+        key_material.extend_from_slice(cache_material);
+        key_material.extend_from_slice(b":eval:");
+        key_material.extend_from_slice(qjs_eval_filename.as_bytes());
+        let key = kawkab_core::bytecode::DiskCache::cache_key(&canonical, &key_material);
         if let Some(bc) = disk
             .load(&key)
             .context("failed to read bytecode cache entry")?
@@ -529,7 +558,7 @@ fn eval_with_bytecode_cache(
             eprintln!("[quickjs] bytecode cache miss -> compile");
         }
         let src = cjs_bytecode_source(exec_src);
-        let bc = kawkab_core::bytecode::compile(ctx, &src, filename)
+        let bc = kawkab_core::bytecode::compile(ctx, &src, qjs_eval_filename)
             .map_err(|e| anyhow::anyhow!("bytecode compile failed: {e}"))?;
         let _ = disk.store(&key, &bc);
         let v = unsafe { kawkab_core::bytecode::exec(ctx, &bc) }
@@ -538,13 +567,21 @@ fn eval_with_bytecode_cache(
     }
 
     if verbose {
-        eprintln!("[quickjs] bytecode disk cache skipped (KAWKAB_SKIP_BYTECODE=1)");
+        eprintln!(
+            "[quickjs] bytecode disk cache skipped (set KAWKAB_ENABLE_BYTECODE_DISK=1 to enable)"
+        );
     }
     let src = cjs_bytecode_source(exec_src);
-    let bc = kawkab_core::bytecode::compile(ctx, &src, filename)
-        .map_err(|e| anyhow::anyhow!("bytecode compile failed: {e}"))?;
-    let v = unsafe { kawkab_core::bytecode::exec(ctx, &bc) }
-        .map_err(|e| anyhow::anyhow!("bytecode exec failed: {e}"))?;
+    let c_filename = CString::new(qjs_eval_filename).unwrap_or_default();
+    let v = unsafe {
+        kawkab_core::qjs_compat::eval(
+            ctx,
+            src.as_ptr() as *const std::os::raw::c_char,
+            src.len(),
+            c_filename.as_ptr(),
+            qjs::JS_EVAL_TYPE_GLOBAL as i32,
+        )
+    };
     Ok(v)
 }
 

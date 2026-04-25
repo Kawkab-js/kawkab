@@ -1,0 +1,8 @@
+{
+  "name": "kawkab-kpi-express-static",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

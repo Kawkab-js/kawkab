@@ -46,10 +46,7 @@ pub enum Task {
         port: u16,
     },
     /// `postMessage` payload from a worker isolate to the main thread (JSON text).
-    WorkerPostToMain {
-        worker_id: u64,
-        json: String,
-    },
+    WorkerPostToMain { worker_id: u64, json: String },
     /// `postMessage` payload from the main thread to a worker isolate (JSON text).
     WorkerPostToWorker { json: String },
     /// Ask a worker isolate loop to exit (worker thread only).

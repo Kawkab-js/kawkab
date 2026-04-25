@@ -197,11 +197,8 @@ fn run_init(cwd: &Path, force: bool, entry: &str) -> anyhow::Result<()> {
 
     let entry_path = cwd.join(entry);
     if !entry_path.exists() {
-        fs::write(
-            &entry_path,
-            "console.log(\"Hello from Kawkab\");\n",
-        )
-        .with_context(|| format!("failed to write {}", entry_path.display()))?;
+        fs::write(&entry_path, "console.log(\"Hello from Kawkab\");\n")
+            .with_context(|| format!("failed to write {}", entry_path.display()))?;
         println!("Created {}", entry_path.display());
     }
 

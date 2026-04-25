@@ -64,17 +64,17 @@ impl Isolate {
     pub fn eval(&mut self, src: &[u8], filename: &str) -> Result<qjs::JSValue, JsError> {
         let c_src = CString::new(src)
             .map_err(|_| JsError::Runtime("Invalid script (embedded NUL byte)".to_string()))?;
-        let c_filename = CString::new(filename)
-            .map_err(|_| JsError::Runtime("Invalid filename".to_string()))?;
+        let c_filename =
+            CString::new(filename).map_err(|_| JsError::Runtime("Invalid filename".to_string()))?;
         let flags = qjs::JS_EVAL_TYPE_GLOBAL as i32;
 
         unsafe {
-            // Length is byte length **excluding** the trailing NUL from `CString` (QuickJS reads
-            // exactly `len` bytes from `input`).
+            // `CString::as_bytes()` already excludes the trailing NUL byte. QuickJS expects the
+            // exact source byte length, so do not trim one more byte here.
             let val = qjs_compat::eval(
                 self.ctx,
                 c_src.as_ptr(),
-                c_src.as_bytes().len().saturating_sub(1),
+                c_src.as_bytes().len(),
                 c_filename.as_ptr(),
                 flags,
             );
@@ -100,6 +100,11 @@ impl Isolate {
 
     pub fn run_pending_jobs(&mut self) -> Result<bool, JsError> {
         unsafe {
+            match crate::node::drain_next_tick_queue(self.ctx) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => return Err(JsError::Js(e)),
+            }
             let mut ctx_out: *mut qjs::JSContext = ptr::null_mut();
             let res = qjs::JS_ExecutePendingJob(self.rt, &mut ctx_out);
             if res < 0 {
@@ -134,6 +139,9 @@ impl Isolate {
 
 impl Drop for Isolate {
     fn drop(&mut self) {
+        // Intentionally do not call `JS_FreeContext` / `JS_FreeRuntime` here: the Node bootstrap
+        // installs long-lived roots and host callbacks; freeing the runtime requires a full
+        // teardown contract (otherwise QuickJS asserts `list_empty(&rt->gc_obj_list)` on free).
         let _ = (self.rt, self.ctx);
     }
 }

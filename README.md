@@ -220,7 +220,7 @@ Detailed module/global status matrix:
   - API-shape-first paths that still need deeper parity hardening (`tls` and advanced Node internals).
 - `querystring` now includes repeated-key array handling and URL-style encode/decode for baseline compatibility flows.
 - Current `crypto` digests are deterministic compatibility outputs for integration checks, not cryptographic-grade parity yet.
-- Current `worker_threads` emulation supports in-runtime lifecycle callbacks (`on`/`postMessage`/`terminate`) but is not a real multi-thread runtime yet.
+- `worker_threads` uses **one OS thread per `Worker`** with an isolated QuickJS runtime and JSON-serializable `postMessage` payloads; it is not full Node/V8 worker semantics (see `docs/FEATURE_BASELINE.md` and `docs/NODE_COMPATIBILITY.md`).
 - `http`/`net` are not full Node `IncomingMessage`/`ServerResponse` stacks: no streaming body, chunked transfer, or WebSockets; use `server.close()` to stop the accept loop and exit the process for short scripts.
 - `snapshot` crate currently writes an experimental manifest format, not a full VM snapshot image.
 - `bridge` currently exposes baseline console bridge hooks only (not a complete host logging pipeline).
@@ -245,6 +245,21 @@ Run via Cargo:
 
 ```bash
 cargo run --release --features tokio-uring -p kawkab-cli -- --file path/to/script.js
+```
+
+Smoke and performance gates:
+
+```bash
+./scripts/compat_smoke.sh
+./scripts/kpi_smoke.sh
+./scripts/runtime_perf_gate.sh
+```
+
+Workspace tests (match CI: one libtest worker process across crates to avoid rare `worker_threads` harness `SIGABRT` overlap):
+
+```bash
+export RUST_TEST_THREADS=1
+cargo test --workspace --features tokio-uring
 ```
 
 ## Security Policy (Host Capabilities)

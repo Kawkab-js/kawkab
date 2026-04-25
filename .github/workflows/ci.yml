@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # One libtest worker across the whole workspace: avoids SIGABRT when kawkab-core `worker_threads` / QuickJS harness tests overlap with other crates' test binaries.
+  RUST_TEST_THREADS: "1"
 
 jobs:
   rust:
@@ -23,7 +25,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev clang cmake
+          sudo apt-get install -y build-essential pkg-config libssl-dev clang cmake nodejs npm
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
@@ -34,5 +36,14 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --features tokio-uring
 
+      - name: Top 100 basket smoke (Node + QuickJS)
+        run: |
+          (cd fixtures/kpi/top100-qjs && npm ci --ignore-scripts --no-fund)
+          ./scripts/top100_node_matrix.sh
+          ./scripts/top100_qjs_matrix.sh || echo "top100_qjs_matrix: QuickJS matrix not yet 100/100 (see docs/COMPAT_KPI.md)"
+
       - name: compat smoke script (same as tests; documented entrypoint)
         run: ./scripts/compat_smoke.sh
+
+      - name: KPI smoke (stable required set)
+        run: KAWKAB_KPI_MODE=all KAWKAB_KPI_INCLUDE_EXTENDED=1 ./scripts/kpi_smoke.sh

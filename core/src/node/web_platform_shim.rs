@@ -37,7 +37,10 @@ unsafe extern "C" fn js_web_compress(
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
     if argc < 2 {
-        return throw_type_error(ctx, "__kawkabWebCompress(format, data) requires 2 arguments");
+        return throw_type_error(
+            ctx,
+            "__kawkabWebCompress(format, data) requires 2 arguments",
+        );
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
     let format = js_string_to_owned(ctx, args[0]);
@@ -127,13 +130,7 @@ pub unsafe fn install(ctx: *mut qjs::JSContext, global: qjs::JSValue) -> Result<
         return Ok(());
     }
 
-    install_c_fn(
-        ctx,
-        global,
-        "__kawkabWebCompress",
-        Some(js_web_compress),
-        2,
-    )?;
+    install_c_fn(ctx, global, "__kawkabWebCompress", Some(js_web_compress), 2)?;
     install_c_fn(
         ctx,
         global,
