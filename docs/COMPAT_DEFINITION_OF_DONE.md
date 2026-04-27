@@ -4,15 +4,19 @@ This document defines what **🟢** and **🟡** mean in `[NODE_COMPATIBILITY.md
 
 **Prioritization:** The 🟢/🟡 matrix describes **module-level** readiness. When roadmap work conflicts (e.g. a rare built-in vs an Express/Nest/Prisma/Next smoke path), **product priority** follows ecosystem KPIs in `[COMPAT_KPI.md](COMPAT_KPI.md)` and scenarios in `[NPM_CORPUS.md](NPM_CORPUS.md)`.
 
-## Legend (contract)
+Quick navigation:
+- [Legend (contract)](#legend-contract)
+- [Scope boundaries](#scope-boundaries)
+- [Review cadence](#review-cadence)
+- [Test stability policy (release gate)](#test-stability-policy-release-gate)
 
+## Legend (contract)
 
 | Mark   | Meaning                                                                                                                                                                                                                                                                                                  |
 | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **🟢** | The documented surface is implemented for **typical npm usage**: common method shapes, stable error *kinds* where scripts branch, and behavior good enough for mainstream packages in the reference corpus. Known gaps vs Node v23 are listed in a short **“Remaining vs Node”** bullet on the same row. |
+| **🟢** | The documented surface is implemented for **typical npm usage**: common method shapes, stable error *kinds* where scripts branch, and behavior good enough for mainstream packages in the reference corpus. Known gaps vs Node v23 are listed in a short **“Remaining vs Node v23”** bullet on the same row. |
 | **🟡** | Intentionally **partial** or **simplified**: enough for many apps, but important overloads, edge cases, or subsystem semantics differ from Node. The row must name the main caveats.                                                                                                                     |
 | **🔴** | Not implemented **by product choice** or not started; may stay 🔴 with rationale in `[NODE_NON_GOALS.md](NODE_NON_GOALS.md)` (or the compatibility matrix).                                                                                                                                              |
-
 
 ## Scope boundaries
 
@@ -24,7 +28,16 @@ This document defines what **🟢** and **🟡** mean in `[NODE_COMPATIBILITY.md
 
 When a phase in the roadmap lands, update in the **same change**:
 
-1. `[NODE_COMPATIBILITY.md](NODE_COMPATIBILITY.md)` — status + “Remaining vs Node”.
+1. `[NODE_COMPATIBILITY.md](NODE_COMPATIBILITY.md)` — status + “Remaining vs Node v23”.
 2. `[FEATURE_BASELINE.md](FEATURE_BASELINE.md)` — summary line if behavior is user-visible.
 3. Optional corpus entry in `[NPM_CORPUS.md](NPM_CORPUS.md)`.
 4. If the change affects a **KPI tier** (Top 100 basket, Express, NestJS, Prisma, Next custom server), update `[COMPAT_KPI.md](COMPAT_KPI.md)` and/or the relevant rows in `[NPM_CORPUS.md](NPM_CORPUS.md)`.
+
+## Test stability policy (release gate)
+
+- `compat_smoke.sh` is a required release gate and must pass on Linux/WSL CI baseline.
+- Any `#[ignore]` compatibility contract is acceptable only when all conditions hold:
+  1. The ignore reason is explicit and actionable in the test attribute message.
+  2. The same limitation is documented in `FEATURE_BASELINE.md` and `RELEASE_CHECKLIST.md`.
+  3. Equivalent behavior is still covered by another stable gate (named contract or smoke path).
+- New ignored tests must be treated as **temporary risk** and tracked for re-enable in roadmap work; do not silently expand the ignored set in release branches.

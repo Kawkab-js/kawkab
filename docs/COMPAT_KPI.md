@@ -2,6 +2,15 @@
 
 This document is the **product-facing compatibility contract**: we optimize for **real stacks and registry usage**, not 100% Node.js built-in API parity. Module-level status remains in `[NODE_COMPATIBILITY.md](NODE_COMPATIBILITY.md)`; **prioritization** when they conflict should follow this file and `[NPM_CORPUS.md](NPM_CORPUS.md)`.
 
+Quick navigation:
+- [Target table](#target-table)
+- [Pass criteria](#pass-criteria)
+- [Frozen Top 100 list](#frozen-top-100-list)
+- [Tier scope (what 100% / 90% includes)](#tier-scope-what-100--90-includes)
+- [Relationship to the compatibility matrix](#relationship-to-the-compatibility-matrix)
+- [Automation](#automation)
+- [Related docs](#related-docs)
+
 ## Target table
 
 

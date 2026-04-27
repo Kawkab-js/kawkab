@@ -12,7 +12,7 @@ pub enum CryptoContext {
     Hash(digest::Context),
     Hmac(hmac::Context),
     Md5(Md5),
-    Blake3(Hasher),
+    Blake3(Box<Hasher>),
 }
 
 thread_local! {
@@ -37,7 +37,7 @@ pub fn create_hash(algorithm: &str) -> Result<u64, String> {
         "sha384" => CryptoContext::Hash(digest::Context::new(&digest::SHA384)),
         "sha1" => CryptoContext::Hash(digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY)),
         "md5" => CryptoContext::Md5(Md5::new()),
-        "blake3" => CryptoContext::Blake3(Hasher::new()),
+        "blake3" => CryptoContext::Blake3(Box::new(Hasher::new())),
         _ => {
             return Err(format!("Unsupported hash algorithm: {}", algorithm));
         }

@@ -2,6 +2,14 @@
 
 Use this before tagging a release or publishing binaries. Adjust version numbers and artifacts to your release process.
 
+Quick navigation:
+- [Preconditions](#preconditions)
+- [Build and tests](#build-and-tests)
+- [Smoke tests](#smoke-tests)
+- [Performance gate](#performance-gate)
+- [Security and defaults](#security-and-defaults)
+- [Artifacts and communication](#artifacts-and-communication)
+
 ## Preconditions
 
 - All changes intended for the release are merged on the release branch.
@@ -17,8 +25,11 @@ Use this before tagging a release or publishing binaries. Adjust version numbers
 ## Smoke tests
 
 - Run runtime smoke suite: `./scripts/compat_smoke.sh`
-- Confirm behavior contracts pass inside smoke (`event_loop_ordering_contract`, `worker_threads_lifecycle_contract`, `worker_a_receive_message_on_port_baseline_contract`, `worker_parent_port_once_one_shot_contract`, `worker_parent_port_remove_all_listeners_contract`).
-- Confirm local behavior contract pass (`stream_pipeline_backpressure_contract`). (`http_client_local_behavior_contract` remains ignored until FFI/runtime hardening closes abort path.)
+- Confirm behavior contracts pass inside smoke (`event_loop_ordering_contract`, `worker_threads_lifecycle_contract`, `worker_parent_port_once_one_shot_contract`, `worker_parent_port_remove_all_listeners_contract`).
+- Confirm web/http compatibility contract passes (`web_platform_http_surface_contract`) as part of the workspace sweep in smoke.
+- Confirm local behavior contract pass (`stream_pipeline_backpressure_contract`).
+- Verify ignored contract list is unchanged and documented (`http_client_local_behavior_contract`, `worker_a_receive_message_on_port_baseline_contract`, `worker_threads_worker_isolate_flags_contract`).
+- Execute ignored HTTP local behavior contract explicitly and record result in release notes: `cargo test -p kawkab-core compat_contract_tests::http_client_local_behavior_contract -- --ignored --nocapture` (must not be treated as pass-by-default just because it is `#[ignore]` in normal sweeps).
 - Run KPI smoke suite: `./scripts/kpi_smoke.sh`
 - Run a minimal script: `./target/release/kawkab --file` on a small `.js` file (see root `README.md`).
 - If PM changes: run `kawkab install` / `kawkab run` on a tiny fixture project.

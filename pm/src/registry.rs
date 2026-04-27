@@ -54,11 +54,18 @@ struct DistDoc {
     integrity: String,
 }
 
+type VersionDocData = (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+    String,
+    String,
+);
+
 impl RegistryClient {
     pub fn new_default() -> anyhow::Result<Self> {
         let client = Client::builder().build()?;
         let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| std::env::temp_dir())
+            .unwrap_or_else(std::env::temp_dir)
             .join("kawkab")
             .join("packages");
         fs::create_dir_all(&cache_dir)?;
@@ -96,12 +103,7 @@ impl RegistryClient {
         &self,
         package: &str,
         version: &Version,
-    ) -> anyhow::Result<(
-        std::collections::BTreeMap<String, String>,
-        std::collections::BTreeMap<String, String>,
-        String,
-        String,
-    )> {
+    ) -> anyhow::Result<VersionDocData> {
         let manifest = self.fetch_manifest(package)?;
         let key = version.to_string();
         let raw = manifest

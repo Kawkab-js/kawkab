@@ -987,16 +987,27 @@
     };
   }
   if (typeof g.Headers !== "function") {
+    function headersFromInit(target, init) {
+      if (!init) return;
+      if (init instanceof g.Headers) {
+        init.forEach(function (v, k) {
+          target.append(k, v);
+        });
+        return;
+      }
+      if (Array.isArray(init)) {
+        for (var i = 0; i < init.length; i++) target.append(init[i][0], init[i][1]);
+        return;
+      }
+      if (typeof init === "object") {
+        var ks = Object.keys(init);
+        for (var j = 0; j < ks.length; j++) target.append(ks[j], init[ks[j]]);
+      }
+    }
     g.Headers = function Headers(init) {
       if (!(this instanceof Headers)) return new Headers(init);
       this._map = {};
-      if (!init) return;
-      if (Array.isArray(init)) {
-        for (var i = 0; i < init.length; i++) this.append(init[i][0], init[i][1]);
-      } else if (typeof init === "object") {
-        var ks = Object.keys(init);
-        for (var j = 0; j < ks.length; j++) this.append(ks[j], init[ks[j]]);
-      }
+      headersFromInit(this, init);
     };
     g.Headers.prototype.append = function (k, v) {
       k = String(k).toLowerCase();
@@ -1016,15 +1027,116 @@
     g.Headers.prototype.delete = function (k) {
       delete this._map[String(k).toLowerCase()];
     };
+    g.Headers.prototype.forEach = function (cb, thisArg) {
+      if (typeof cb !== "function") throw new TypeError("callback must be a function");
+      var ks = Object.keys(this._map);
+      for (var i = 0; i < ks.length; i++) {
+        var k = ks[i];
+        cb.call(thisArg, this._map[k], k, this);
+      }
+    };
+    g.Headers.prototype.entries = function () {
+      var ks = Object.keys(this._map);
+      var idx = 0;
+      var map = this._map;
+      return {
+        next: function () {
+          if (idx >= ks.length) return { value: undefined, done: true };
+          var k = ks[idx++];
+          return { value: [k, map[k]], done: false };
+        },
+      };
+    };
+    g.Headers.prototype.keys = function () {
+      var ks = Object.keys(this._map);
+      var idx = 0;
+      return {
+        next: function () {
+          if (idx >= ks.length) return { value: undefined, done: true };
+          return { value: ks[idx++], done: false };
+        },
+      };
+    };
+    g.Headers.prototype.values = function () {
+      var ks = Object.keys(this._map);
+      var idx = 0;
+      var map = this._map;
+      return {
+        next: function () {
+          if (idx >= ks.length) return { value: undefined, done: true };
+          return { value: map[ks[idx++]], done: false };
+        },
+      };
+    };
+    g.Headers.prototype.getSetCookie = function () {
+      var v = this.get("set-cookie");
+      if (v == null) return [];
+      // Baseline behavior: single combined header entry.
+      return [v];
+    };
   }
   if (typeof g.Request !== "function") {
+    function consumeBodyOnce(holder, readFn) {
+      if (holder.bodyUsed) return Promise.reject(new TypeError("Body is unusable"));
+      holder.bodyUsed = true;
+      try {
+        return Promise.resolve(readFn());
+      } catch (e) {
+        return Promise.reject(e);
+      }
+    }
+    function bodyToText(body) {
+      if (body == null) return Promise.resolve("");
+      if (typeof body === "string") return Promise.resolve(body);
+      if (body instanceof Uint8Array) return Promise.resolve(utf8Decode(body));
+      if (body instanceof ArrayBuffer) return Promise.resolve(utf8Decode(new Uint8Array(body)));
+      return Promise.resolve(String(body));
+    }
+    function bodyToArrayBuffer(body) {
+      if (body == null) return Promise.resolve(new ArrayBuffer(0));
+      if (body instanceof ArrayBuffer) return Promise.resolve(body.slice(0));
+      if (body instanceof Uint8Array) {
+        return Promise.resolve(
+          body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength)
+        );
+      }
+      return Promise.resolve(utf8Encode(String(body)).buffer);
+    }
     g.Request = function Request(input, init) {
       if (!(this instanceof Request)) return new Request(input, init);
       init = init || {};
-      this.url = String(input || "");
-      this.method = String(init.method || "GET").toUpperCase();
-      this.headers = init.headers instanceof g.Headers ? init.headers : new g.Headers(init.headers);
-      this.body = init.body == null ? null : init.body;
+      var baseReq = input instanceof g.Request ? input : null;
+      this.url = String(baseReq ? baseReq.url : input || "");
+      this.method = String(init.method || (baseReq ? baseReq.method : "GET")).toUpperCase();
+      var hdrs = init.headers != null ? init.headers : baseReq ? baseReq.headers : undefined;
+      this.headers = hdrs instanceof g.Headers ? new g.Headers(hdrs) : new g.Headers(hdrs);
+      this._body = init.body != null ? init.body : baseReq ? baseReq._body : null;
+      this.body = this._body;
+      this.bodyUsed = false;
+    };
+    g.Request.prototype.clone = function () {
+      if (this.bodyUsed) throw new TypeError("Body is unusable");
+      return new g.Request(this);
+    };
+    g.Request.prototype.text = function () {
+      var self = this;
+      return consumeBodyOnce(self, function () {
+        return bodyToText(self._body);
+      });
+    };
+    g.Request.prototype.arrayBuffer = function () {
+      var self = this;
+      return consumeBodyOnce(self, function () {
+        return bodyToArrayBuffer(self._body);
+      });
+    };
+    g.Request.prototype.json = function () {
+      var self = this;
+      return consumeBodyOnce(self, function () {
+        return bodyToText(self._body).then(function (t) {
+          return JSON.parse(t);
+        });
+      });
     };
   }
   if (typeof g.Response !== "function") {
@@ -1035,24 +1147,57 @@
       this.statusText = String(init.statusText || "");
       this.headers = init.headers instanceof g.Headers ? init.headers : new g.Headers(init.headers);
       this._body = body == null ? "" : body;
+      this.bodyUsed = false;
       this.ok = this.status >= 200 && this.status < 300;
     };
     g.Response.prototype.text = function () {
+      if (this.bodyUsed) return Promise.reject(new TypeError("Body is unusable"));
+      this.bodyUsed = true;
       if (typeof this._body === "string") return Promise.resolve(this._body);
       if (this._body instanceof Uint8Array) return Promise.resolve(utf8Decode(this._body));
       if (this._body instanceof ArrayBuffer) return Promise.resolve(utf8Decode(new Uint8Array(this._body)));
       return Promise.resolve(String(this._body));
     };
     g.Response.prototype.arrayBuffer = function () {
+      if (this.bodyUsed) return Promise.reject(new TypeError("Body is unusable"));
+      this.bodyUsed = true;
       if (this._body instanceof ArrayBuffer) return Promise.resolve(this._body);
-      if (this._body instanceof Uint8Array) return Promise.resolve(this._body.buffer.slice(0));
+      if (this._body instanceof Uint8Array) {
+        return Promise.resolve(
+          this._body.buffer.slice(this._body.byteOffset, this._body.byteOffset + this._body.byteLength)
+        );
+      }
       return Promise.resolve(utf8Encode(String(this._body)).buffer);
+    };
+    g.Response.prototype.json = function () {
+      return this.text().then(function (t) {
+        return JSON.parse(t);
+      });
+    };
+    g.Response.prototype.clone = function () {
+      if (this.bodyUsed) throw new TypeError("Body is unusable");
+      return new g.Response(this._body, {
+        status: this.status,
+        statusText: this.statusText,
+        headers: new g.Headers(this.headers),
+      });
+    };
+    g.Response.json = function (data, init) {
+      init = init || {};
+      var headers = new g.Headers(init.headers);
+      if (!headers.has("content-type")) headers.set("content-type", "application/json");
+      var body = JSON.stringify(data === undefined ? null : data);
+      return new g.Response(body, {
+        status: init.status != null ? init.status : 200,
+        statusText: init.statusText != null ? String(init.statusText) : "",
+        headers: headers,
+      });
     };
   }
   if (typeof g.fetch !== "function") {
     g.fetch = function fetch(input, init) {
-      var req = input instanceof g.Request ? input : new g.Request(input, init);
-      return Promise.resolve(new g.Response("", { status: 200, headers: req.headers }));
+      var req = input instanceof g.Request ? new g.Request(input, init || {}) : new g.Request(input, init);
+      return Promise.resolve(new g.Response("", { status: 200, headers: new g.Headers(req.headers) }));
     };
   }
   if (typeof g.WebAssembly !== "object" || !g.WebAssembly) {

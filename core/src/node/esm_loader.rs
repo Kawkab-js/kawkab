@@ -419,10 +419,7 @@ unsafe extern "C" fn js_import_meta_resolve(
 ) -> qjs::JSValue {
     super::refresh_package_exports_node_env(ctx);
     if argc < 1 {
-        return qjs::JS_ThrowTypeError(
-            ctx,
-            b"resolve(specifier) requires primary argument\0".as_ptr() as *const i8,
-        );
+        return qjs::JS_ThrowTypeError(ctx, c"resolve(specifier) requires primary argument".as_ptr());
     }
     let specifier = js_string_to_owned(ctx, *argv);
     let base_dir = js_string_to_owned(ctx, *data);
@@ -474,7 +471,7 @@ pub unsafe fn eval_esm_entry(
         let exc = qjs::JS_GetException(ctx);
         let msg = js_string_to_owned(ctx, exc);
 
-        let line_val = qjs::JS_GetPropertyStr(ctx, exc, b"lineNumber\0".as_ptr() as *const i8);
+        let line_val = qjs::JS_GetPropertyStr(ctx, exc, c"lineNumber".as_ptr());
         let line = if line_val.tag == qjs::JS_TAG_INT as i64 {
             line_val.u.int32
         } else {
@@ -482,7 +479,7 @@ pub unsafe fn eval_esm_entry(
         };
         js_free_value(ctx, line_val);
 
-        let file_val = qjs::JS_GetPropertyStr(ctx, exc, b"fileName\0".as_ptr() as *const i8);
+        let file_val = qjs::JS_GetPropertyStr(ctx, exc, c"fileName".as_ptr());
         let file_name = if qjs::JS_IsString(file_val) {
             js_string_to_owned(ctx, file_val)
         } else {

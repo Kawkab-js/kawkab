@@ -295,8 +295,8 @@ fn parse_pm_command(args: &[String]) -> anyhow::Result<Option<pm::PmCommand>> {
 }
 
 fn split_package_and_range(value: &str) -> (String, String) {
-    if value.starts_with('@') {
-        if let Some(at) = value[1..].find('@') {
+    if let Some(stripped) = value.strip_prefix('@') {
+        if let Some(at) = stripped.find('@') {
             let split = at + 1;
             let name = value[..split + 1].to_string();
             let range = value[split + 2..].to_string();

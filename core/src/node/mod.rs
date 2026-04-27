@@ -132,6 +132,67 @@ static NEXT_HTTP_BODY_ACCUM_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_DGRAM_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PROMISE_ID: AtomicU64 = AtomicU64::new(1);
 static TRACE_EVENTS_ENABLED: AtomicBool = AtomicBool::new(false);
+static MODULE_BUILTIN_NAMES: &[&str] = &[
+    "assert",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "dns/promises",
+    "domain",
+    "events",
+    "fs",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "module",
+    "net",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "readline/promises",
+    "repl",
+    "stream",
+    "string_decoder",
+    "sys",
+    "test",
+    "timers",
+    "timers/promises",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+    "node:test",
+];
+
+fn module_is_builtin_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if MODULE_BUILTIN_NAMES.contains(&trimmed) {
+        return true;
+    }
+    if let Some(rest) = trimmed.strip_prefix("node:") {
+        return MODULE_BUILTIN_NAMES.contains(&rest);
+    }
+    false
+}
 
 /// Count of async timers that have been scheduled but not yet fired/cancelled.
 /// Used by the CLI runner to decide when to exit.
@@ -613,7 +674,202 @@ pub(crate) unsafe fn bind_require_and_entry_paths(
     set_str_prop(ctx, global, "__filename", entry_filename)?;
     set_str_prop(ctx, global, "__dirname", base_dir)?;
     install_c_fn(ctx, global, "require", Some(js_require), 1)?;
+    let require_fn = qjs::JS_GetPropertyStr(ctx, global, CString::new("require").unwrap().as_ptr());
+    if !qjs::JS_IsUndefined(require_fn) && !qjs::JS_IsException(require_fn) {
+        let _ = install_require_resolve_helper(ctx, require_fn, base_dir);
+    }
+    js_free_value(ctx, require_fn);
     Ok(())
+}
+
+unsafe fn install_require_resolve_helper(
+    ctx: *mut qjs::JSContext,
+    require_fn: qjs::JSValue,
+    base_dir: &str,
+) -> Result<(), String> {
+    let parent_val = qjs_compat::new_string_from_str(ctx, base_dir);
+    let mut resolve_data = [parent_val];
+    let resolve_fn = qjs::JS_NewCFunctionData(
+        ctx,
+        Some(js_require_resolve_bound_to_dir),
+        1,
+        0,
+        1,
+        resolve_data.as_mut_ptr(),
+    );
+    let parent_val_for_paths = qjs_compat::new_string_from_str(ctx, base_dir);
+    let mut paths_data = [parent_val_for_paths];
+    let resolve_paths_fn = qjs::JS_NewCFunctionData(
+        ctx,
+        Some(js_require_resolve_paths_bound_to_dir),
+        1,
+        0,
+        1,
+        paths_data.as_mut_ptr(),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        resolve_fn,
+        CString::new("paths").map_err(|e| e.to_string())?.as_ptr(),
+        resolve_paths_fn,
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        require_fn,
+        CString::new("resolve").map_err(|e| e.to_string())?.as_ptr(),
+        resolve_fn,
+    );
+    install_require_common_props(ctx, require_fn)?;
+    Ok(())
+}
+
+unsafe fn get_or_create_require_cache(ctx: *mut qjs::JSContext) -> qjs::JSValue {
+    let global = qjs::JS_GetGlobalObject(ctx);
+    let key = CString::new("__kawkabRequireCache").unwrap();
+    let cur = qjs::JS_GetPropertyStr(ctx, global, key.as_ptr());
+    if qjs::JS_IsObject(cur) {
+        let out = js_dup_value(cur);
+        js_free_value(ctx, cur);
+        js_free_value(ctx, global);
+        return out;
+    }
+    js_free_value(ctx, cur);
+    let obj = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(ctx, global, key.as_ptr(), js_dup_value(obj));
+    js_free_value(ctx, global);
+    obj
+}
+
+unsafe fn get_or_create_require_extensions(ctx: *mut qjs::JSContext) -> qjs::JSValue {
+    let global = qjs::JS_GetGlobalObject(ctx);
+    let key = CString::new("__kawkabRequireExtensions").unwrap();
+    let cur = qjs::JS_GetPropertyStr(ctx, global, key.as_ptr());
+    if qjs::JS_IsObject(cur) {
+        let out = js_dup_value(cur);
+        js_free_value(ctx, cur);
+        js_free_value(ctx, global);
+        return out;
+    }
+    js_free_value(ctx, cur);
+    let obj = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, obj, ".js", Some(js_noop), 2);
+    let _ = install_obj_fn(ctx, obj, ".json", Some(js_noop), 2);
+    let _ = install_obj_fn(ctx, obj, ".node", Some(js_noop), 2);
+    qjs::JS_SetPropertyStr(ctx, global, key.as_ptr(), js_dup_value(obj));
+    js_free_value(ctx, global);
+    obj
+}
+
+unsafe fn get_or_create_require_main(ctx: *mut qjs::JSContext) -> qjs::JSValue {
+    let global = qjs::JS_GetGlobalObject(ctx);
+    let key = CString::new("__kawkabRequireMain").unwrap();
+    let cur = qjs::JS_GetPropertyStr(ctx, global, key.as_ptr());
+    if qjs::JS_IsObject(cur) {
+        let out = js_dup_value(cur);
+        js_free_value(ctx, cur);
+        js_free_value(ctx, global);
+        return out;
+    }
+    js_free_value(ctx, cur);
+    let entry_v = qjs::JS_GetPropertyStr(
+        ctx,
+        global,
+        CString::new("__kawkabEntryFile").unwrap().as_ptr(),
+    );
+    let entry = if qjs::JS_IsUndefined(entry_v) || qjs::JS_IsNull(entry_v) {
+        ".".to_string()
+    } else {
+        js_string_to_owned(ctx, entry_v)
+    };
+    js_free_value(ctx, entry_v);
+    let main_obj = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        main_obj,
+        CString::new("id").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "."),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        main_obj,
+        CString::new("filename").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &entry),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        main_obj,
+        CString::new("exports").unwrap().as_ptr(),
+        qjs::JS_NewObject(ctx),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        main_obj,
+        CString::new("loaded").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(ctx, global, key.as_ptr(), js_dup_value(main_obj));
+    js_free_value(ctx, global);
+    main_obj
+}
+
+unsafe fn install_require_common_props(
+    ctx: *mut qjs::JSContext,
+    require_fn: qjs::JSValue,
+) -> Result<(), String> {
+    let cache = get_or_create_require_cache(ctx);
+    let extensions = get_or_create_require_extensions(ctx);
+    let main = get_or_create_require_main(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        require_fn,
+        CString::new("cache").map_err(|e| e.to_string())?.as_ptr(),
+        cache,
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        require_fn,
+        CString::new("extensions")
+            .map_err(|e| e.to_string())?
+            .as_ptr(),
+        extensions,
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        require_fn,
+        CString::new("main").map_err(|e| e.to_string())?.as_ptr(),
+        main,
+    );
+    Ok(())
+}
+
+fn module_lookup_paths(base_dir: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = PathBuf::from(base_dir);
+    if cur.is_file() {
+        if let Some(parent) = cur.parent() {
+            cur = parent.to_path_buf();
+        }
+    }
+    loop {
+        out.push(cur.join("node_modules").to_string_lossy().to_string());
+        if !cur.pop() {
+            break;
+        }
+    }
+    out
+}
+
+unsafe fn js_array_from_strings(ctx: *mut qjs::JSContext, values: &[String]) -> qjs::JSValue {
+    let out = qjs::JS_NewArray(ctx);
+    for (idx, p) in values.iter().enumerate() {
+        qjs::JS_SetPropertyUint32(
+            ctx,
+            out,
+            idx as u32,
+            qjs_compat::new_string_from_str(ctx, p),
+        );
+    }
+    out
 }
 
 unsafe fn set_str_prop(
@@ -992,12 +1248,92 @@ Transform.prototype.write = function(chunk, enc, cb) {
   return ok;
 };
 
+var finished = function(stream, opts, cb) {
+  if (typeof opts === 'function') {
+    cb = opts;
+    opts = {};
+  }
+  var done = false;
+  var cleanup = function() {
+    if (!stream || typeof stream.removeListener !== 'function') return;
+    stream.removeListener('end', onDone);
+    stream.removeListener('finish', onDone);
+    stream.removeListener('close', onDone);
+    stream.removeListener('error', onErr);
+  };
+  var onDone = function() {
+    if (done) return;
+    done = true;
+    cleanup();
+    if (typeof cb === 'function') cb(null);
+  };
+  var onErr = function(err) {
+    if (done) return;
+    done = true;
+    cleanup();
+    if (typeof cb === 'function') cb(err || new Error('stream error'));
+  };
+  if (stream && typeof stream.on === 'function') {
+    stream.on('end', onDone);
+    stream.on('finish', onDone);
+    stream.on('close', onDone);
+    stream.on('error', onErr);
+  } else {
+    setTimeout(onErr, 0);
+  }
+  if (typeof cb !== 'function') {
+    return new Promise(function(resolve, reject) {
+      cb = function(err) { if (err) reject(err); else resolve(); };
+    });
+  }
+};
+
+var pipeline = function() {
+  var args = Array.prototype.slice.call(arguments);
+  var cb = null;
+  if (args.length > 0 && typeof args[args.length - 1] === 'function') cb = args.pop();
+  if (args.length < 2) throw new TypeError('pipeline requires at least two streams');
+  var streams = args;
+  var done = false;
+  var finish = function(err) {
+    if (done) return;
+    done = true;
+    if (typeof cb === 'function') cb(err || null);
+  };
+  for (var i = 0; i < streams.length - 1; i++) {
+    if (streams[i] && typeof streams[i].pipe === 'function') {
+      streams[i].pipe(streams[i + 1], {
+        errorHandler: function(err) { finish(err); }
+      });
+    } else {
+      throw new TypeError('pipeline expects stream-like objects');
+    }
+  }
+  var last = streams[streams.length - 1];
+  finished(last, function(err) { finish(err); });
+  return last;
+};
+
 var __streamExports = {};
 __streamExports.Readable = Readable;
 __streamExports.Writable = Writable;
 __streamExports.Duplex = Duplex;
 __streamExports.Transform = Transform;
 __streamExports.Stream = Duplex;
+__streamExports.finished = finished;
+__streamExports.pipeline = pipeline;
+__streamExports.promises = {
+  finished: function(stream, opts) {
+    return finished(stream, opts);
+  },
+  pipeline: function() {
+    var args = Array.prototype.slice.call(arguments);
+    return new Promise(function(resolve, reject) {
+      args.push(function(err) { if (err) reject(err); else resolve(); });
+      pipeline.apply(null, args);
+    });
+  }
+};
 return __streamExports;
 "#;
 
@@ -1865,10 +2201,23 @@ fn base64_decode_char(c: u8) -> Option<u8> {
 
 fn base64_decode_data(s: &str) -> Result<Vec<u8>, ()> {
     let mut bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    while !bytes.is_empty() && bytes.len() % 4 != 0 {
-        bytes.push(b'=');
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rem = bytes.len() % 4;
+    if rem == 1 {
+        return Err(());
+    }
+    if rem != 0 {
+        // Accept unpadded base64 for common web/runtime compatibility.
+        let pad = 4 - rem;
+        bytes.extend(std::iter::repeat_n(b'=', pad));
     }
     if bytes.len() % 4 != 0 {
+        return Err(());
+    }
+    let first_pad = bytes.iter().position(|b| *b == b'=').unwrap_or(bytes.len());
+    if bytes[first_pad..].iter().any(|b| *b != b'=') {
         return Err(());
     }
     let mut out = Vec::new();
@@ -1905,7 +2254,19 @@ unsafe extern "C" fn js_global_btoa(
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
     let s = js_string_to_owned(ctx, args[0]);
-    let raw: Vec<u8> = s.chars().map(|c| (c as u32).min(255) as u8).collect();
+    let mut raw: Vec<u8> = Vec::with_capacity(s.len());
+    for ch in s.chars() {
+        let code = ch as u32;
+        if code > 0xff {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                CString::new("Invalid character in btoa input")
+                    .unwrap()
+                    .as_ptr(),
+            );
+        }
+        raw.push(code as u8);
+    }
     let enc = base64_encode_bytes(&raw);
     qjs_compat::new_string_from_str(ctx, &enc)
 }
@@ -2007,11 +2368,7 @@ unsafe fn install_web_compat_globals(ctx: *mut qjs::JSContext) {
         sc_file.as_ptr(),
         qjs::JS_EVAL_TYPE_GLOBAL as i32,
     );
-    if !is_exception(sc_ret) {
-        js_free_value(ctx, sc_ret);
-    } else {
-        js_free_value(ctx, sc_ret);
-    }
+    js_free_value(ctx, sc_ret);
     let loose = CString::new("globalThis.__kawkabLooseEq=function(a,b){return a==b;};").unwrap();
     let file = CString::new("kawkab:loose-eq").unwrap();
     let _ = qjs_compat::eval(
@@ -2782,11 +3139,7 @@ unsafe fn dgram_emit(
             } else {
                 qjs::JS_Call(ctx, cb, sock, 0, std::ptr::null_mut())
             };
-            if is_exception(ret) {
-                js_free_value(ctx, ret);
-            } else {
-                js_free_value(ctx, ret);
-            }
+            js_free_value(ctx, ret);
         }
         if keep {
             qjs::JS_SetPropertyUint32(ctx, next_arr, ni, js_dup_value(entry));
@@ -7374,7 +7727,7 @@ unsafe extern "C" fn js_timers_promises_set_timeout(
     if qjs::JS_ToInt64(ctx, &mut delay_i, args[0]) != 0 {
         return qjs::JS_GetException(ctx);
     }
-    let delay_ms = delay_i.max(0).min(86_400_000_i64) as u64;
+    let delay_ms = delay_i.clamp(0, 86_400_000_i64) as u64;
     let value = if argc > 1 {
         js_dup_value(args[1])
     } else {
@@ -8196,6 +8549,7 @@ unsafe fn build_http_client_response_object(
     status_text: &str,
     headers: &std::collections::HashMap<String, String>,
     body: Vec<u8>,
+    final_url: &str,
 ) -> qjs::JSValue {
     let res = qjs::JS_NewObject(ctx);
     qjs::JS_SetPropertyStr(
@@ -8210,7 +8564,79 @@ unsafe fn build_http_client_response_object(
         CString::new("statusMessage").unwrap().as_ptr(),
         qjs_compat::new_string_from_str(ctx, status_text),
     );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("httpVersion").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "1.1"),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("httpVersionMajor").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 1),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("httpVersionMinor").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 1),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("complete").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("aborted").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("url").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, final_url),
+    );
+    let socket_obj = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        socket_obj,
+        CString::new("encrypted").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        socket_obj,
+        CString::new("authorized").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        socket_obj,
+        CString::new("authorizationError").unwrap().as_ptr(),
+        js_null(),
+    );
+    let _ = install_obj_fn(ctx, socket_obj, "setTimeout", Some(js_noop), 2);
+    let _ = install_obj_fn(ctx, socket_obj, "setKeepAlive", Some(js_noop), 2);
+    let _ = install_obj_fn(ctx, socket_obj, "setNoDelay", Some(js_noop), 1);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("socket").unwrap().as_ptr(),
+        js_dup_value(socket_obj),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("connection").unwrap().as_ptr(),
+        socket_obj,
+    );
     let hdr = qjs::JS_NewObject(ctx);
+    let raw_headers = qjs::JS_NewArray(ctx);
+    let mut raw_idx: u32 = 0;
     for (k, v) in headers {
         let ck = CString::new(k.as_str()).unwrap_or_default();
         qjs::JS_SetPropertyStr(
@@ -8219,12 +8645,247 @@ unsafe fn build_http_client_response_object(
             ck.as_ptr(),
             qjs_compat::new_string_from_str(ctx, v),
         );
+        qjs::JS_SetPropertyUint32(
+            ctx,
+            raw_headers,
+            raw_idx,
+            qjs_compat::new_string_from_str(ctx, k),
+        );
+        raw_idx += 1;
+        qjs::JS_SetPropertyUint32(
+            ctx,
+            raw_headers,
+            raw_idx,
+            qjs_compat::new_string_from_str(ctx, v),
+        );
+        raw_idx += 1;
     }
     qjs::JS_SetPropertyStr(ctx, res, CString::new("headers").unwrap().as_ptr(), hdr);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("rawHeaders").unwrap().as_ptr(),
+        raw_headers,
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("trailers").unwrap().as_ptr(),
+        qjs::JS_NewObject(ctx),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("rawTrailers").unwrap().as_ptr(),
+        qjs::JS_NewArray(ctx),
+    );
     let body_val =
         unsafe { crate::ffi::arraybuffer_from_arc(ctx, Arc::from(body.into_boxed_slice())) };
     qjs::JS_SetPropertyStr(ctx, res, CString::new("body").unwrap().as_ptr(), body_val);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        res,
+        CString::new("__kawkabListeners").unwrap().as_ptr(),
+        qjs::JS_NewObject(ctx),
+    );
+    let _ = install_obj_fn(ctx, res, "on", Some(js_http_client_res_on), 2);
+    let _ = install_obj_fn(ctx, res, "addListener", Some(js_http_client_res_on), 2);
+    let _ = install_obj_fn(ctx, res, "once", Some(js_http_client_res_once), 2);
+    let _ = install_obj_fn(
+        ctx,
+        res,
+        "removeListener",
+        Some(js_http_client_res_remove_listener),
+        2,
+    );
+    let _ = install_obj_fn(ctx, res, "emit", Some(js_http_client_res_emit), 2);
+    let _ = install_obj_fn(
+        ctx,
+        res,
+        "setEncoding",
+        Some(js_http_client_res_set_encoding),
+        1,
+    );
     res
+}
+
+unsafe fn http_client_res_listeners_bucket(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    event: &str,
+    create: bool,
+) -> qjs::JSValue {
+    let store = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabListeners").unwrap().as_ptr(),
+    );
+    if !qjs::JS_IsObject(store) {
+        js_free_value(ctx, store);
+        return js_undefined();
+    }
+    let key = CString::new(event).unwrap_or_default();
+    let bucket = qjs::JS_GetPropertyStr(ctx, store, key.as_ptr());
+    if qjs::JS_IsObject(bucket) {
+        js_free_value(ctx, store);
+        return bucket;
+    }
+    js_free_value(ctx, bucket);
+    if !create {
+        js_free_value(ctx, store);
+        return js_undefined();
+    }
+    let arr = qjs::JS_NewArray(ctx);
+    qjs::JS_SetPropertyStr(ctx, store, key.as_ptr(), js_dup_value(arr));
+    js_free_value(ctx, store);
+    arr
+}
+
+unsafe extern "C" fn js_http_client_res_on(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return this;
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    if qjs::JS_IsFunction(ctx, args[1]) == 0 {
+        return this;
+    }
+    let event = js_string_to_owned(ctx, args[0]);
+    let bucket = http_client_res_listeners_bucket(ctx, this, &event, true);
+    if qjs::JS_IsObject(bucket) {
+        let lenv = qjs::JS_GetPropertyStr(ctx, bucket, CString::new("length").unwrap().as_ptr());
+        let mut len: i32 = 0;
+        let _ = qjs::JS_ToInt32(ctx, &mut len, lenv);
+        js_free_value(ctx, lenv);
+        qjs::JS_SetPropertyUint32(ctx, bucket, len as u32, js_dup_value(args[1]));
+        js_free_value(ctx, bucket);
+    }
+    this
+}
+
+unsafe extern "C" fn js_http_client_res_once(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    js_http_client_res_on(ctx, this, argc, argv)
+}
+
+unsafe extern "C" fn js_http_client_res_remove_listener(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return this;
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    if qjs::JS_IsFunction(ctx, args[1]) == 0 {
+        return this;
+    }
+    let event = js_string_to_owned(ctx, args[0]);
+    let bucket = http_client_res_listeners_bucket(ctx, this, &event, false);
+    if !qjs::JS_IsObject(bucket) {
+        return this;
+    }
+    let lenv = qjs::JS_GetPropertyStr(ctx, bucket, CString::new("length").unwrap().as_ptr());
+    let mut len: i32 = 0;
+    let _ = qjs::JS_ToInt32(ctx, &mut len, lenv);
+    js_free_value(ctx, lenv);
+    let next = qjs::JS_NewArray(ctx);
+    let mut ni: u32 = 0;
+    for i in 0..len {
+        let v = qjs::JS_GetPropertyUint32(ctx, bucket, i as u32);
+        if qjs::JS_StrictEq(ctx, v, args[1]) == 0 {
+            qjs::JS_SetPropertyUint32(ctx, next, ni, v);
+            ni += 1;
+        } else {
+            js_free_value(ctx, v);
+        }
+    }
+    let store = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabListeners").unwrap().as_ptr(),
+    );
+    if qjs::JS_IsObject(store) {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            store,
+            CString::new(event).unwrap_or_default().as_ptr(),
+            next,
+        );
+        js_free_value(ctx, store);
+    } else {
+        js_free_value(ctx, next);
+        js_free_value(ctx, store);
+    }
+    js_free_value(ctx, bucket);
+    this
+}
+
+unsafe extern "C" fn js_http_client_res_emit(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_NewBool(ctx, false);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let event = js_string_to_owned(ctx, args[0]);
+    let payload = if argc >= 2 {
+        js_dup_value(args[1])
+    } else {
+        js_undefined()
+    };
+    let bucket = http_client_res_listeners_bucket(ctx, this, &event, false);
+    if !qjs::JS_IsObject(bucket) {
+        js_free_value(ctx, payload);
+        return qjs::JS_NewBool(ctx, false);
+    }
+    let lenv = qjs::JS_GetPropertyStr(ctx, bucket, CString::new("length").unwrap().as_ptr());
+    let mut len: i32 = 0;
+    let _ = qjs::JS_ToInt32(ctx, &mut len, lenv);
+    js_free_value(ctx, lenv);
+    for i in 0..len {
+        let cb = qjs::JS_GetPropertyUint32(ctx, bucket, i as u32);
+        if qjs::JS_IsFunction(ctx, cb) != 0 {
+            let mut a = [js_dup_value(payload)];
+            let r = qjs::JS_Call(ctx, cb, this, 1, a.as_mut_ptr());
+            js_free_value(ctx, r);
+        }
+        js_free_value(ctx, cb);
+    }
+    js_free_value(ctx, bucket);
+    js_free_value(ctx, payload);
+    qjs::JS_NewBool(ctx, len > 0)
+}
+
+unsafe extern "C" fn js_http_client_res_set_encoding(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc >= 1 {
+        let args = std::slice::from_raw_parts(argv, argc as usize);
+        let enc = js_string_to_owned(ctx, args[0]);
+        qjs::JS_SetPropertyStr(
+            ctx,
+            this,
+            CString::new("__kawkabResEncoding").unwrap().as_ptr(),
+            qjs_compat::new_string_from_str(ctx, &enc),
+        );
+    }
+    this
 }
 
 unsafe extern "C" fn js_http_client_get(
@@ -8255,7 +8916,7 @@ unsafe extern "C" fn js_http_client_get(
     let fetch_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let client = http_blocking_client();
         let resp = client
-            .get(&url)
+            .request(reqwest::Method::GET, &url)
             .send()
             .map_err(|e| format!("http.get: request failed: {e}"))?;
         let status = resp.status().as_u16();
@@ -8297,20 +8958,2543 @@ unsafe extern "C" fn js_http_client_get(
             );
         }
     };
-    let res_obj = build_http_client_response_object(ctx, status, &status_text, &hdr_map, body);
+    let res_obj =
+        build_http_client_response_object(ctx, status, &status_text, &hdr_map, body, &url);
     let mut arg = [res_obj];
     let out = qjs::JS_Call(ctx, cb, js_undefined(), 1, arg.as_mut_ptr());
     js_free_value(ctx, out);
+    let emit_fn = qjs::JS_GetPropertyStr(ctx, res_obj, CString::new("emit").unwrap().as_ptr());
+    if qjs::JS_IsFunction(ctx, emit_fn) != 0 {
+        let body_v = qjs::JS_GetPropertyStr(ctx, res_obj, CString::new("body").unwrap().as_ptr());
+        let ev_data = qjs_compat::new_string_from_str(ctx, "data");
+        let mut args_data = [ev_data, body_v];
+        let r1 = qjs::JS_Call(ctx, emit_fn, res_obj, 2, args_data.as_mut_ptr());
+        js_free_value(ctx, r1);
+        let ev_end = qjs_compat::new_string_from_str(ctx, "end");
+        let mut args_end = [ev_end];
+        let r2 = qjs::JS_Call(ctx, emit_fn, res_obj, 1, args_end.as_mut_ptr());
+        js_free_value(ctx, r2);
+    }
+    js_free_value(ctx, emit_fn);
     js_undefined()
 }
 
-unsafe extern "C" fn js_http_client_request(
+unsafe fn js_obj_get_opt_string(
+    ctx: *mut qjs::JSContext,
+    obj: qjs::JSValue,
+    key: &str,
+) -> Option<String> {
+    if !qjs::JS_IsObject(obj) {
+        return None;
+    }
+    let v = qjs::JS_GetPropertyStr(ctx, obj, CString::new(key).unwrap_or_default().as_ptr());
+    if qjs::JS_IsUndefined(v) || qjs::JS_IsNull(v) {
+        js_free_value(ctx, v);
+        return None;
+    }
+    let s = js_string_to_owned(ctx, v);
+    js_free_value(ctx, v);
+    Some(s)
+}
+
+unsafe fn build_http_request_url_from_options(
+    ctx: *mut qjs::JSContext,
+    opts: qjs::JSValue,
+) -> String {
+    let protocol =
+        js_obj_get_opt_string(ctx, opts, "protocol").unwrap_or_else(|| "http:".to_string());
+    let host = js_obj_get_opt_string(ctx, opts, "hostname")
+        .or_else(|| js_obj_get_opt_string(ctx, opts, "host"))
+        .unwrap_or_else(|| "localhost".to_string());
+    let port = js_obj_get_opt_string(ctx, opts, "port").unwrap_or_default();
+    let path = js_obj_get_opt_string(ctx, opts, "path").unwrap_or_else(|| {
+        let pathname =
+            js_obj_get_opt_string(ctx, opts, "pathname").unwrap_or_else(|| "/".to_string());
+        let search = js_obj_get_opt_string(ctx, opts, "search").unwrap_or_default();
+        if search.is_empty() {
+            pathname
+        } else if search.starts_with('?') {
+            format!("{pathname}{search}")
+        } else {
+            format!("{pathname}?{search}")
+        }
+    });
+    let auth = js_obj_get_opt_string(ctx, opts, "auth").unwrap_or_default();
+    let scheme = if protocol.ends_with(':') {
+        protocol
+    } else {
+        format!("{protocol}:")
+    };
+    let host_with_auth = if auth.is_empty() {
+        host
+    } else {
+        format!("{auth}@{host}")
+    };
+    let host_port = if port.is_empty() || host_with_auth.contains(':') {
+        host_with_auth
+    } else {
+        format!("{host_with_auth}:{port}")
+    };
+    let path_norm = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+    format!("{scheme}//{host_port}{path_norm}")
+}
+
+fn http_request_extract_path(url: &str) -> String {
+    if let Some(scheme_idx) = url.find("://") {
+        let rest = &url[(scheme_idx + 3)..];
+        if let Some(slash_idx) = rest.find('/') {
+            return rest[slash_idx..].to_string();
+        }
+        return "/".to_string();
+    }
+    if url.starts_with('/') {
+        return url.to_string();
+    }
+    "/".to_string()
+}
+
+fn http_request_extract_authority(url: &str) -> String {
+    if let Some(scheme_idx) = url.find("://") {
+        let rest = &url[(scheme_idx + 3)..];
+        let end_idx = rest.find('/').unwrap_or(rest.len());
+        return rest[..end_idx].to_string();
+    }
+    String::new()
+}
+
+fn http_request_extract_protocol(url: &str) -> String {
+    if let Some(scheme_idx) = url.find("://") {
+        return format!("{}:", &url[..scheme_idx]);
+    }
+    "http:".to_string()
+}
+
+fn http_request_extract_hostname(url: &str) -> String {
+    let authority = http_request_extract_authority(url);
+    let no_auth = if let Some(at_idx) = authority.rfind('@') {
+        &authority[(at_idx + 1)..]
+    } else {
+        authority.as_str()
+    };
+    if no_auth.is_empty() {
+        return "localhost".to_string();
+    }
+    if let Some(colon_idx) = no_auth.rfind(':') {
+        return no_auth[..colon_idx].to_string();
+    }
+    no_auth.to_string()
+}
+
+fn http_request_extract_port(url: &str) -> String {
+    let authority = http_request_extract_authority(url);
+    let no_auth = if let Some(at_idx) = authority.rfind('@') {
+        &authority[(at_idx + 1)..]
+    } else {
+        authority.as_str()
+    };
+    if let Some(colon_idx) = no_auth.rfind(':') {
+        let candidate = &no_auth[(colon_idx + 1)..];
+        if !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_digit()) {
+            return candidate.to_string();
+        }
+    }
+    String::new()
+}
+
+unsafe fn http_request_collect_body_bytes(ctx: *mut qjs::JSContext, req: qjs::JSValue) -> Vec<u8> {
+    let chunks = qjs::JS_GetPropertyStr(
+        ctx,
+        req,
+        CString::new("__kawkabReqChunks").unwrap().as_ptr(),
+    );
+    if !qjs::JS_IsObject(chunks) {
+        js_free_value(ctx, chunks);
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Ok(len) = js_array_length_u32(ctx, chunks) {
+        for i in 0..len {
+            let v = qjs::JS_GetPropertyUint32(ctx, chunks, i);
+            if qjs::JS_IsString(v) {
+                out.extend_from_slice(js_string_to_owned(ctx, v).as_bytes());
+            } else {
+                let b = buffer::buffer_bytes_from_value(ctx, v);
+                out.extend_from_slice(&b);
+            }
+            js_free_value(ctx, v);
+        }
+    }
+    js_free_value(ctx, chunks);
+    out
+}
+
+unsafe fn http_request_headers_map(
+    ctx: *mut qjs::JSContext,
+    req: qjs::JSValue,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let hdrs = qjs::JS_GetPropertyStr(
+        ctx,
+        req,
+        CString::new("__kawkabReqHeaders").unwrap().as_ptr(),
+    );
+    if !qjs::JS_IsObject(hdrs) {
+        js_free_value(ctx, hdrs);
+        return out;
+    }
+    if let Ok(keys) = assert_own_enum_string_keys(ctx, hdrs) {
+        for k in keys {
+            let kv = qjs::JS_GetPropertyStr(
+                ctx,
+                hdrs,
+                CString::new(k.clone()).unwrap_or_default().as_ptr(),
+            );
+            if !qjs::JS_IsUndefined(kv) && !qjs::JS_IsNull(kv) {
+                out.insert(k.to_ascii_lowercase(), js_string_to_owned(ctx, kv));
+            }
+            js_free_value(ctx, kv);
+        }
+    }
+    js_free_value(ctx, hdrs);
+    out
+}
+
+unsafe fn http_client_req_listeners_bucket(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    event: &str,
+    create: bool,
+) -> qjs::JSValue {
+    let store = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqListeners").unwrap().as_ptr(),
+    );
+    if !qjs::JS_IsObject(store) {
+        js_free_value(ctx, store);
+        return js_undefined();
+    }
+    let key = CString::new(event).unwrap_or_default();
+    let bucket = qjs::JS_GetPropertyStr(ctx, store, key.as_ptr());
+    if qjs::JS_IsObject(bucket) {
+        js_free_value(ctx, store);
+        return bucket;
+    }
+    js_free_value(ctx, bucket);
+    if !create {
+        js_free_value(ctx, store);
+        return js_undefined();
+    }
+    let arr = qjs::JS_NewArray(ctx);
+    qjs::JS_SetPropertyStr(ctx, store, key.as_ptr(), js_dup_value(arr));
+    js_free_value(ctx, store);
+    arr
+}
+
+unsafe extern "C" fn js_http_client_req_on(
     ctx: *mut qjs::JSContext,
     this: qjs::JSValue,
     argc: c_int,
     argv: *mut qjs::JSValue,
 ) -> qjs::JSValue {
-    js_http_client_get(ctx, this, argc, argv)
+    if argc < 2 {
+        return this;
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    if qjs::JS_IsFunction(ctx, args[1]) == 0 {
+        return this;
+    }
+    let event = js_string_to_owned(ctx, args[0]);
+    let bucket = http_client_req_listeners_bucket(ctx, this, &event, true);
+    if qjs::JS_IsObject(bucket) {
+        let lenv = qjs::JS_GetPropertyStr(ctx, bucket, CString::new("length").unwrap().as_ptr());
+        let mut len: i32 = 0;
+        let _ = qjs::JS_ToInt32(ctx, &mut len, lenv);
+        js_free_value(ctx, lenv);
+        qjs::JS_SetPropertyUint32(ctx, bucket, len as u32, js_dup_value(args[1]));
+    }
+    js_free_value(ctx, bucket);
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_emit(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_NewBool(ctx, false);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let event = js_string_to_owned(ctx, args[0]);
+    let payload = if argc >= 2 {
+        js_dup_value(args[1])
+    } else {
+        js_undefined()
+    };
+    let bucket = http_client_req_listeners_bucket(ctx, this, &event, false);
+    if !qjs::JS_IsObject(bucket) {
+        js_free_value(ctx, payload);
+        return qjs::JS_NewBool(ctx, false);
+    }
+    let lenv = qjs::JS_GetPropertyStr(ctx, bucket, CString::new("length").unwrap().as_ptr());
+    let mut len: i32 = 0;
+    let _ = qjs::JS_ToInt32(ctx, &mut len, lenv);
+    js_free_value(ctx, lenv);
+    for i in 0..len {
+        let cb = qjs::JS_GetPropertyUint32(ctx, bucket, i as u32);
+        if qjs::JS_IsFunction(ctx, cb) != 0 {
+            let mut a = [js_dup_value(payload)];
+            let r = qjs::JS_Call(ctx, cb, this, 1, a.as_mut_ptr());
+            js_free_value(ctx, r);
+        }
+        js_free_value(ctx, cb);
+    }
+    js_free_value(ctx, bucket);
+    js_free_value(ctx, payload);
+    qjs::JS_NewBool(ctx, len > 0)
+}
+
+unsafe extern "C" fn js_http_client_req_set_max_listeners(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
+    let n = if argc >= 1 {
+        let mut v: i32 = 0;
+        let _ = qjs::JS_ToInt32(ctx, &mut v, args[0]);
+        v.max(0) as i64
+    } else {
+        10
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqMaxListeners").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, n),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_get_max_listeners(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let v = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqMaxListeners").unwrap().as_ptr(),
+    );
+    if qjs::JS_IsUndefined(v) || qjs::JS_IsNull(v) {
+        js_free_value(ctx, v);
+        return qjs_compat::new_int(ctx, 10);
+    }
+    v
+}
+
+unsafe extern "C" fn js_http_client_req_remove_listener(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return this;
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    if qjs::JS_IsFunction(ctx, args[1]) == 0 {
+        return this;
+    }
+    let event = js_string_to_owned(ctx, args[0]);
+    let bucket = http_client_req_listeners_bucket(ctx, this, &event, false);
+    if !qjs::JS_IsObject(bucket) {
+        return this;
+    }
+    let lenv = qjs::JS_GetPropertyStr(ctx, bucket, CString::new("length").unwrap().as_ptr());
+    let mut len: i32 = 0;
+    let _ = qjs::JS_ToInt32(ctx, &mut len, lenv);
+    js_free_value(ctx, lenv);
+    let next = qjs::JS_NewArray(ctx);
+    let mut ni: u32 = 0;
+    for i in 0..len {
+        let v = qjs::JS_GetPropertyUint32(ctx, bucket, i as u32);
+        if qjs::JS_StrictEq(ctx, v, args[1]) == 0 {
+            qjs::JS_SetPropertyUint32(ctx, next, ni, v);
+            ni += 1;
+        } else {
+            js_free_value(ctx, v);
+        }
+    }
+    let store = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqListeners").unwrap().as_ptr(),
+    );
+    if qjs::JS_IsObject(store) {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            store,
+            CString::new(event).unwrap_or_default().as_ptr(),
+            next,
+        );
+    } else {
+        js_free_value(ctx, next);
+    }
+    js_free_value(ctx, store);
+    js_free_value(ctx, bucket);
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_remove_all_listeners(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let store = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqListeners").unwrap().as_ptr(),
+    );
+    if !qjs::JS_IsObject(store) {
+        js_free_value(ctx, store);
+        return this;
+    }
+    if argc >= 1 {
+        let args = std::slice::from_raw_parts(argv, argc as usize);
+        let event = js_string_to_owned(ctx, args[0]);
+        qjs::JS_SetPropertyStr(
+            ctx,
+            store,
+            CString::new(event).unwrap_or_default().as_ptr(),
+            qjs::JS_NewArray(ctx),
+        );
+    } else if let Ok(keys) = assert_own_enum_string_keys(ctx, store) {
+        for k in keys {
+            qjs::JS_SetPropertyStr(
+                ctx,
+                store,
+                CString::new(k).unwrap_or_default().as_ptr(),
+                qjs::JS_NewArray(ctx),
+            );
+        }
+    }
+    js_free_value(ctx, store);
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_listener_count(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs_compat::new_int(ctx, 0);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let event = js_string_to_owned(ctx, args[0]);
+    let bucket = http_client_req_listeners_bucket(ctx, this, &event, false);
+    if !qjs::JS_IsObject(bucket) {
+        return qjs_compat::new_int(ctx, 0);
+    }
+    let lenv = qjs::JS_GetPropertyStr(ctx, bucket, CString::new("length").unwrap().as_ptr());
+    let mut len: i32 = 0;
+    let _ = qjs::JS_ToInt32(ctx, &mut len, lenv);
+    js_free_value(ctx, lenv);
+    js_free_value(ctx, bucket);
+    qjs_compat::new_int(ctx, len.max(0) as i64)
+}
+
+unsafe extern "C" fn js_http_client_req_event_names(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let store = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqListeners").unwrap().as_ptr(),
+    );
+    if !qjs::JS_IsObject(store) {
+        js_free_value(ctx, store);
+        return qjs::JS_NewArray(ctx);
+    }
+    let out = qjs::JS_NewArray(ctx);
+    if let Ok(keys) = assert_own_enum_string_keys(ctx, store) {
+        let mut idx: u32 = 0;
+        for k in keys {
+            let bucket = qjs::JS_GetPropertyStr(
+                ctx,
+                store,
+                CString::new(k.clone()).unwrap_or_default().as_ptr(),
+            );
+            if qjs::JS_IsObject(bucket) {
+                let lenv =
+                    qjs::JS_GetPropertyStr(ctx, bucket, CString::new("length").unwrap().as_ptr());
+                let mut len: i32 = 0;
+                let _ = qjs::JS_ToInt32(ctx, &mut len, lenv);
+                js_free_value(ctx, lenv);
+                if len > 0 {
+                    qjs::JS_SetPropertyUint32(
+                        ctx,
+                        out,
+                        idx,
+                        qjs_compat::new_string_from_str(ctx, &k),
+                    );
+                    idx += 1;
+                }
+            }
+            js_free_value(ctx, bucket);
+        }
+    }
+    js_free_value(ctx, store);
+    out
+}
+
+unsafe extern "C" fn js_http_client_req_listeners(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_NewArray(ctx);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let event = js_string_to_owned(ctx, args[0]);
+    let bucket = http_client_req_listeners_bucket(ctx, this, &event, false);
+    if !qjs::JS_IsObject(bucket) {
+        return qjs::JS_NewArray(ctx);
+    }
+    let out = qjs::JS_NewArray(ctx);
+    let lenv = qjs::JS_GetPropertyStr(ctx, bucket, CString::new("length").unwrap().as_ptr());
+    let mut len: i32 = 0;
+    let _ = qjs::JS_ToInt32(ctx, &mut len, lenv);
+    js_free_value(ctx, lenv);
+    for i in 0..len.max(0) {
+        let cb = qjs::JS_GetPropertyUint32(ctx, bucket, i as u32);
+        qjs::JS_SetPropertyUint32(ctx, out, i as u32, cb);
+    }
+    js_free_value(ctx, bucket);
+    out
+}
+
+unsafe extern "C" fn js_http_client_req_raw_listeners(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    js_http_client_req_listeners(ctx, this, argc, argv)
+}
+
+unsafe extern "C" fn js_http_client_req_set_timeout(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
+    let ms = if argc >= 1 {
+        let mut v: i32 = 0;
+        let _ = qjs::JS_ToInt32(ctx, &mut v, args[0]);
+        v.max(0) as i64
+    } else {
+        0
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqTimeoutMs").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, ms),
+    );
+    let socket = qjs::JS_GetPropertyStr(ctx, this, CString::new("socket").unwrap().as_ptr());
+    if qjs::JS_IsObject(socket) {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("timeout").unwrap().as_ptr(),
+            qjs_compat::new_int(ctx, ms),
+        );
+    }
+    js_free_value(ctx, socket);
+    if argc >= 2 && qjs::JS_IsFunction(ctx, args[1]) != 0 {
+        let mut call_args = [
+            qjs_compat::new_string_from_str(ctx, "timeout"),
+            js_dup_value(args[1]),
+        ];
+        let _ = js_http_client_req_on(ctx, this, 2, call_args.as_mut_ptr());
+    }
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_socket_set_timeout(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
+    let ms = if argc >= 1 {
+        let mut v: i32 = 0;
+        let _ = qjs::JS_ToInt32(ctx, &mut v, args[0]);
+        v.max(0) as i64
+    } else {
+        0
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("timeout").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, ms),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_abort(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqAborted").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("aborted").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("destroyed").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("finished").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("closed").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    let socket = qjs::JS_GetPropertyStr(ctx, this, CString::new("socket").unwrap().as_ptr());
+    if qjs::JS_IsObject(socket) {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("destroyed").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, true),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("readyState").unwrap().as_ptr(),
+            qjs_compat::new_string_from_str(ctx, "closed"),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("closed").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, true),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("readable").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, false),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("writable").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, false),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("connecting").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, false),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("pending").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, false),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("bufferSize").unwrap().as_ptr(),
+            qjs_compat::new_int(ctx, 0),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("writableLength").unwrap().as_ptr(),
+            qjs_compat::new_int(ctx, 0),
+        );
+    }
+    js_free_value(ctx, socket);
+    let ev = qjs_compat::new_string_from_str(ctx, "abort");
+    let mut a = [ev];
+    let _ = js_http_client_req_emit(ctx, this, 1, a.as_mut_ptr());
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_write(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_NewBool(ctx, true);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let chunk_len = if qjs::JS_IsString(args[0]) {
+        js_string_to_owned(ctx, args[0]).len() as i64
+    } else {
+        buffer::buffer_bytes_from_value(ctx, args[0]).len() as i64
+    };
+    let chunks = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqChunks").unwrap().as_ptr(),
+    );
+    if qjs::JS_IsObject(chunks) {
+        let lenv = qjs::JS_GetPropertyStr(ctx, chunks, CString::new("length").unwrap().as_ptr());
+        let mut len: i32 = 0;
+        let _ = qjs::JS_ToInt32(ctx, &mut len, lenv);
+        js_free_value(ctx, lenv);
+        qjs::JS_SetPropertyUint32(ctx, chunks, len as u32, js_dup_value(args[0]));
+    }
+    js_free_value(ctx, chunks);
+    let socket = qjs::JS_GetPropertyStr(ctx, this, CString::new("socket").unwrap().as_ptr());
+    if qjs::JS_IsObject(socket) {
+        let cur_v =
+            qjs::JS_GetPropertyStr(ctx, socket, CString::new("bufferSize").unwrap().as_ptr());
+        let mut cur: i32 = 0;
+        let _ = qjs::JS_ToInt32(ctx, &mut cur, cur_v);
+        js_free_value(ctx, cur_v);
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("bufferSize").unwrap().as_ptr(),
+            qjs_compat::new_int(ctx, (cur.max(0) as i64) + chunk_len),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("writableLength").unwrap().as_ptr(),
+            qjs_compat::new_int(ctx, (cur.max(0) as i64) + chunk_len),
+        );
+    }
+    js_free_value(ctx, socket);
+    if argc >= 2 && qjs::JS_IsFunction(ctx, args[1]) != 0 {
+        let mut a: [qjs::JSValue; 0] = [];
+        let r = qjs::JS_Call(ctx, args[1], this, 0, a.as_mut_ptr());
+        js_free_value(ctx, r);
+    }
+    qjs::JS_NewBool(ctx, true)
+}
+
+unsafe extern "C" fn js_http_client_req_set_header(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return this;
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let key = js_string_to_owned(ctx, args[0]).to_ascii_lowercase();
+    let val = if qjs::JS_IsArray(ctx, args[1]) != 0 {
+        let mut parts = Vec::new();
+        if let Ok(len) = js_array_length_u32(ctx, args[1]) {
+            for i in 0..len {
+                let item = qjs::JS_GetPropertyUint32(ctx, args[1], i);
+                if !qjs::JS_IsUndefined(item) && !qjs::JS_IsNull(item) {
+                    parts.push(js_string_to_owned(ctx, item));
+                }
+                js_free_value(ctx, item);
+            }
+        }
+        parts.join(", ")
+    } else {
+        js_string_to_owned(ctx, args[1])
+    };
+    let hdrs = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqHeaders").unwrap().as_ptr(),
+    );
+    if qjs::JS_IsObject(hdrs) {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            hdrs,
+            CString::new(key).unwrap_or_default().as_ptr(),
+            qjs_compat::new_string_from_str(ctx, &val),
+        );
+    }
+    js_free_value(ctx, hdrs);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("_header").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "[kawkab-header-set]"),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_append_header(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 2 {
+        return this;
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let key_input = js_string_to_owned(ctx, args[0]);
+    let key = key_input.to_ascii_lowercase();
+    let incoming = if qjs::JS_IsArray(ctx, args[1]) != 0 {
+        let mut parts = Vec::new();
+        if let Ok(len) = js_array_length_u32(ctx, args[1]) {
+            for i in 0..len {
+                let item = qjs::JS_GetPropertyUint32(ctx, args[1], i);
+                if !qjs::JS_IsUndefined(item) && !qjs::JS_IsNull(item) {
+                    parts.push(js_string_to_owned(ctx, item));
+                }
+                js_free_value(ctx, item);
+            }
+        }
+        parts.join(", ")
+    } else {
+        js_string_to_owned(ctx, args[1])
+    };
+    let mut get_args = [qjs_compat::new_string_from_str(ctx, &key)];
+    let current = js_http_client_req_get_header(ctx, this, 1, get_args.as_mut_ptr());
+    let merged = if !qjs::JS_IsUndefined(current) && !qjs::JS_IsNull(current) {
+        let cur = js_string_to_owned(ctx, current);
+        if cur.is_empty() {
+            incoming
+        } else if incoming.is_empty() {
+            cur
+        } else {
+            format!("{cur}, {incoming}")
+        }
+    } else {
+        incoming
+    };
+    js_free_value(ctx, current);
+    let mut set_args = [
+        qjs_compat::new_string_from_str(ctx, &key_input),
+        qjs_compat::new_string_from_str(ctx, &merged),
+    ];
+    js_http_client_req_set_header(ctx, this, 2, set_args.as_mut_ptr())
+}
+
+unsafe extern "C" fn js_http_client_req_remove_header(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return this;
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let key = js_string_to_owned(ctx, args[0]).to_ascii_lowercase();
+    let hdrs = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqHeaders").unwrap().as_ptr(),
+    );
+    if qjs::JS_IsObject(hdrs) {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            hdrs,
+            CString::new(key).unwrap_or_default().as_ptr(),
+            js_undefined(),
+        );
+    }
+    js_free_value(ctx, hdrs);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("_header").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "[kawkab-header-updated]"),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_get_header(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return js_undefined();
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let key = js_string_to_owned(ctx, args[0]).to_ascii_lowercase();
+    let hdrs = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqHeaders").unwrap().as_ptr(),
+    );
+    if !qjs::JS_IsObject(hdrs) {
+        js_free_value(ctx, hdrs);
+        return js_undefined();
+    }
+    let out = qjs::JS_GetPropertyStr(ctx, hdrs, CString::new(key).unwrap_or_default().as_ptr());
+    js_free_value(ctx, hdrs);
+    out
+}
+
+unsafe extern "C" fn js_http_client_req_has_header(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_NewBool(ctx, false);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let key = js_string_to_owned(ctx, args[0]).to_ascii_lowercase();
+    let hdrs = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqHeaders").unwrap().as_ptr(),
+    );
+    if !qjs::JS_IsObject(hdrs) {
+        js_free_value(ctx, hdrs);
+        return qjs::JS_NewBool(ctx, false);
+    }
+    let v = qjs::JS_GetPropertyStr(ctx, hdrs, CString::new(key).unwrap_or_default().as_ptr());
+    let exists = !qjs::JS_IsUndefined(v) && !qjs::JS_IsNull(v);
+    js_free_value(ctx, v);
+    js_free_value(ctx, hdrs);
+    qjs::JS_NewBool(ctx, exists)
+}
+
+unsafe extern "C" fn js_http_client_req_get_headers(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let hdrs = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqHeaders").unwrap().as_ptr(),
+    );
+    if !qjs::JS_IsObject(hdrs) {
+        js_free_value(ctx, hdrs);
+        return qjs::JS_NewObject(ctx);
+    }
+    let out = qjs::JS_NewObject(ctx);
+    if let Ok(keys) = assert_own_enum_string_keys(ctx, hdrs) {
+        for k in keys {
+            let v = qjs::JS_GetPropertyStr(
+                ctx,
+                hdrs,
+                CString::new(k.clone()).unwrap_or_default().as_ptr(),
+            );
+            if !qjs::JS_IsUndefined(v) && !qjs::JS_IsNull(v) {
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    out,
+                    CString::new(k).unwrap_or_default().as_ptr(),
+                    js_dup_value(v),
+                );
+            }
+            js_free_value(ctx, v);
+        }
+    }
+    js_free_value(ctx, hdrs);
+    out
+}
+
+unsafe extern "C" fn js_http_client_req_get_header_names(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let hdrs = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqHeaders").unwrap().as_ptr(),
+    );
+    if !qjs::JS_IsObject(hdrs) {
+        js_free_value(ctx, hdrs);
+        return qjs::JS_NewArray(ctx);
+    }
+    let out = qjs::JS_NewArray(ctx);
+    if let Ok(keys) = assert_own_enum_string_keys(ctx, hdrs) {
+        let mut idx: u32 = 0;
+        for k in keys {
+            let v = qjs::JS_GetPropertyStr(
+                ctx,
+                hdrs,
+                CString::new(k.clone()).unwrap_or_default().as_ptr(),
+            );
+            if !qjs::JS_IsUndefined(v) && !qjs::JS_IsNull(v) {
+                qjs::JS_SetPropertyUint32(ctx, out, idx, qjs_compat::new_string_from_str(ctx, &k));
+                idx += 1;
+            }
+            js_free_value(ctx, v);
+        }
+    }
+    js_free_value(ctx, hdrs);
+    out
+}
+
+unsafe extern "C" fn js_http_client_req_get_raw_header_names(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    js_http_client_req_get_header_names(ctx, this, argc, argv)
+}
+
+unsafe extern "C" fn js_http_client_req_flush_headers(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("headersSent").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("_headerSent").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_set_no_delay(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
+    let enabled = if argc >= 1 {
+        qjs::JS_ToBool(ctx, args[0]) != 0
+    } else {
+        true
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqNoDelay").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, enabled),
+    );
+    let socket = qjs::JS_GetPropertyStr(ctx, this, CString::new("socket").unwrap().as_ptr());
+    if qjs::JS_IsObject(socket) {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("noDelay").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, enabled),
+        );
+    }
+    js_free_value(ctx, socket);
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_set_socket_keep_alive(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
+    let enabled = if argc >= 1 {
+        qjs::JS_ToBool(ctx, args[0]) != 0
+    } else {
+        false
+    };
+    let delay = if argc >= 2 {
+        let mut v: i32 = 0;
+        let _ = qjs::JS_ToInt32(ctx, &mut v, args[1]);
+        v.max(0) as i64
+    } else {
+        0
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqKeepAlive").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, enabled),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqKeepAliveInitialDelayMs")
+            .unwrap()
+            .as_ptr(),
+        qjs_compat::new_int(ctx, delay),
+    );
+    let socket = qjs::JS_GetPropertyStr(ctx, this, CString::new("socket").unwrap().as_ptr());
+    if qjs::JS_IsObject(socket) {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("keepAlive").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, enabled),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("keepAliveInitialDelay").unwrap().as_ptr(),
+            qjs_compat::new_int(ctx, delay),
+        );
+    }
+    js_free_value(ctx, socket);
+    this
+}
+
+unsafe extern "C" fn js_http_client_socket_set_no_delay(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
+    let enabled = if argc >= 1 {
+        qjs::JS_ToBool(ctx, args[0]) != 0
+    } else {
+        true
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("noDelay").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, enabled),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_socket_set_keep_alive(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
+    let enabled = if argc >= 1 {
+        qjs::JS_ToBool(ctx, args[0]) != 0
+    } else {
+        false
+    };
+    let delay = if argc >= 2 {
+        let mut v: i32 = 0;
+        let _ = qjs::JS_ToInt32(ctx, &mut v, args[1]);
+        v.max(0) as i64
+    } else {
+        0
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("keepAlive").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, enabled),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("keepAliveInitialDelay").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, delay),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_socket_address(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let out = qjs::JS_NewObject(ctx);
+    let local_addr =
+        qjs::JS_GetPropertyStr(ctx, this, CString::new("localAddress").unwrap().as_ptr());
+    let local_port = qjs::JS_GetPropertyStr(ctx, this, CString::new("localPort").unwrap().as_ptr());
+    let addr_v = if qjs::JS_IsUndefined(local_addr) || qjs::JS_IsNull(local_addr) {
+        js_free_value(ctx, local_addr);
+        qjs_compat::new_string_from_str(ctx, "127.0.0.1")
+    } else {
+        local_addr
+    };
+    let port_v = if qjs::JS_IsUndefined(local_port) || qjs::JS_IsNull(local_port) {
+        js_free_value(ctx, local_port);
+        qjs_compat::new_int(ctx, 0)
+    } else {
+        local_port
+    };
+    qjs::JS_SetPropertyStr(ctx, out, CString::new("address").unwrap().as_ptr(), addr_v);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        out,
+        CString::new("family").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "IPv4"),
+    );
+    qjs::JS_SetPropertyStr(ctx, out, CString::new("port").unwrap().as_ptr(), port_v);
+    out
+}
+
+unsafe extern "C" fn js_http_client_socket_ref(
+    _ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    this
+}
+
+unsafe extern "C" fn js_http_client_socket_unref(
+    _ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    this
+}
+
+unsafe extern "C" fn js_http_client_socket_set_encoding(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
+    let enc = if argc >= 1 && !qjs::JS_IsUndefined(args[0]) && !qjs::JS_IsNull(args[0]) {
+        js_string_to_owned(ctx, args[0])
+    } else {
+        "utf8".to_string()
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("encoding").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &enc),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_socket_end(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("destroyed").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("readyState").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "closed"),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("closed").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("connecting").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("pending").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("readable").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("writable").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("bufferSize").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("writableLength").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_socket_destroy(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let out = js_http_client_socket_end(ctx, this, argc, argv);
+    if argc > 0 {
+        let args = std::slice::from_raw_parts(argv, argc as usize);
+        if !qjs::JS_IsUndefined(args[0]) && !qjs::JS_IsNull(args[0]) {
+            qjs::JS_SetPropertyStr(
+                ctx,
+                this,
+                CString::new("error").unwrap().as_ptr(),
+                js_dup_value(args[0]),
+            );
+        }
+    }
+    out
+}
+
+unsafe extern "C" fn js_http_client_req_cork(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let current_v =
+        qjs::JS_GetPropertyStr(ctx, this, CString::new("writableCorked").unwrap().as_ptr());
+    let mut current: i32 = 0;
+    let _ = qjs::JS_ToInt32(ctx, &mut current, current_v);
+    js_free_value(ctx, current_v);
+    let next = current.saturating_add(1);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqCorked").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("writableCorked").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, next as i64),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_uncork(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    _argc: c_int,
+    _argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let current_v =
+        qjs::JS_GetPropertyStr(ctx, this, CString::new("writableCorked").unwrap().as_ptr());
+    let mut current: i32 = 0;
+    let _ = qjs::JS_ToInt32(ctx, &mut current, current_v);
+    js_free_value(ctx, current_v);
+    let next = if current > 0 { current - 1 } else { 0 };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqCorked").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, next > 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("writableCorked").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, next as i64),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_set_default_encoding(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    let args = std::slice::from_raw_parts(argv, argc.max(0) as usize);
+    let enc = if argc >= 1 && !qjs::JS_IsUndefined(args[0]) && !qjs::JS_IsNull(args[0]) {
+        js_string_to_owned(ctx, args[0])
+    } else {
+        "utf8".to_string()
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqDefaultEncoding").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &enc),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("writableDefaultEncoding").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &enc),
+    );
+    this
+}
+
+unsafe extern "C" fn js_http_client_req_end(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc >= 1 {
+        let _ = js_http_client_req_write(ctx, this, 1, argv);
+    }
+    let url_v = qjs::JS_GetPropertyStr(ctx, this, CString::new("__kawkabReqUrl").unwrap().as_ptr());
+    let method_v = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqMethod").unwrap().as_ptr(),
+    );
+    let cb_v = qjs::JS_GetPropertyStr(ctx, this, CString::new("__kawkabReqCb").unwrap().as_ptr());
+    let url = js_string_to_owned(ctx, url_v);
+    let method = js_string_to_owned(ctx, method_v);
+    let aborted_v = qjs::JS_GetPropertyStr(
+        ctx,
+        this,
+        CString::new("__kawkabReqAborted").unwrap().as_ptr(),
+    );
+    let is_aborted = qjs::JS_ToBool(ctx, aborted_v) != 0;
+    js_free_value(ctx, aborted_v);
+    if is_aborted {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            this,
+            CString::new("writableEnded").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, true),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            this,
+            CString::new("finished").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, true),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            this,
+            CString::new("closed").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, true),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            this,
+            CString::new("headersSent").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, false),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            this,
+            CString::new("_headerSent").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, false),
+        );
+        let socket = qjs::JS_GetPropertyStr(ctx, this, CString::new("socket").unwrap().as_ptr());
+        if qjs::JS_IsObject(socket) {
+            qjs::JS_SetPropertyStr(
+                ctx,
+                socket,
+                CString::new("destroyed").unwrap().as_ptr(),
+                qjs::JS_NewBool(ctx, true),
+            );
+            qjs::JS_SetPropertyStr(
+                ctx,
+                socket,
+                CString::new("readyState").unwrap().as_ptr(),
+                qjs_compat::new_string_from_str(ctx, "closed"),
+            );
+            qjs::JS_SetPropertyStr(
+                ctx,
+                socket,
+                CString::new("closed").unwrap().as_ptr(),
+                qjs::JS_NewBool(ctx, true),
+            );
+            qjs::JS_SetPropertyStr(
+                ctx,
+                socket,
+                CString::new("readable").unwrap().as_ptr(),
+                qjs::JS_NewBool(ctx, false),
+            );
+            qjs::JS_SetPropertyStr(
+                ctx,
+                socket,
+                CString::new("writable").unwrap().as_ptr(),
+                qjs::JS_NewBool(ctx, false),
+            );
+            qjs::JS_SetPropertyStr(
+                ctx,
+                socket,
+                CString::new("connecting").unwrap().as_ptr(),
+                qjs::JS_NewBool(ctx, false),
+            );
+            qjs::JS_SetPropertyStr(
+                ctx,
+                socket,
+                CString::new("pending").unwrap().as_ptr(),
+                qjs::JS_NewBool(ctx, false),
+            );
+            qjs::JS_SetPropertyStr(
+                ctx,
+                socket,
+                CString::new("bufferSize").unwrap().as_ptr(),
+                qjs_compat::new_int(ctx, 0),
+            );
+            qjs::JS_SetPropertyStr(
+                ctx,
+                socket,
+                CString::new("writableLength").unwrap().as_ptr(),
+                qjs_compat::new_int(ctx, 0),
+            );
+        }
+        js_free_value(ctx, socket);
+        js_free_value(ctx, cb_v);
+        return this;
+    }
+    js_free_value(ctx, url_v);
+    js_free_value(ctx, method_v);
+
+    if qjs::JS_IsFunction(ctx, cb_v) != 0 {
+        let req_socket =
+            qjs::JS_GetPropertyStr(ctx, this, CString::new("socket").unwrap().as_ptr());
+        if qjs::JS_IsObject(req_socket) {
+            qjs::JS_SetPropertyStr(
+                ctx,
+                req_socket,
+                CString::new("connecting").unwrap().as_ptr(),
+                qjs::JS_NewBool(ctx, false),
+            );
+            qjs::JS_SetPropertyStr(
+                ctx,
+                req_socket,
+                CString::new("pending").unwrap().as_ptr(),
+                qjs::JS_NewBool(ctx, false),
+            );
+        }
+        js_free_value(ctx, req_socket);
+        let headers = http_request_headers_map(ctx, this);
+        let body = http_request_collect_body_bytes(ctx, this);
+        let request_body_len = body.len() as i64;
+        let req_socket =
+            qjs::JS_GetPropertyStr(ctx, this, CString::new("socket").unwrap().as_ptr());
+        if qjs::JS_IsObject(req_socket) {
+            qjs::JS_SetPropertyStr(
+                ctx,
+                req_socket,
+                CString::new("bytesWritten").unwrap().as_ptr(),
+                qjs_compat::new_int(ctx, request_body_len),
+            );
+        }
+        js_free_value(ctx, req_socket);
+        let fetch_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let client = http_blocking_client();
+            let method_parsed =
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+            let mut req = client.request(method_parsed, &url);
+            if !headers.is_empty() {
+                let mut hm = reqwest::header::HeaderMap::new();
+                for (k, v) in &headers {
+                    if let (Ok(kn), Ok(vv)) = (
+                        reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                        reqwest::header::HeaderValue::from_str(v),
+                    ) {
+                        hm.insert(kn, vv);
+                    }
+                }
+                req = req.headers(hm);
+            }
+            if !body.is_empty() {
+                req = req.body(body);
+            }
+            let resp = req
+                .send()
+                .map_err(|e| format!("http.request: request failed: {e}"))?;
+            let status = resp.status().as_u16();
+            let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+            let mut hdr_map: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (name, value) in resp.headers().iter() {
+                let k = name.as_str().to_ascii_lowercase();
+                let v = value.to_str().unwrap_or("");
+                hdr_map
+                    .entry(k)
+                    .and_modify(|e| {
+                        e.push_str(", ");
+                        e.push_str(v);
+                    })
+                    .or_insert_with(|| v.to_string());
+            }
+            let body = resp
+                .bytes()
+                .map_err(|e| format!("http.request: read body: {e}"))?
+                .to_vec();
+            Ok::<
+                (
+                    u16,
+                    String,
+                    std::collections::HashMap<String, String>,
+                    Vec<u8>,
+                ),
+                String,
+            >((status, status_text, hdr_map, body))
+        }));
+        match fetch_res {
+            Ok(Ok((status, status_text, hdr_map, body))) => {
+                let response_body_len = body.len() as i64;
+                let res_obj = build_http_client_response_object(
+                    ctx,
+                    status,
+                    &status_text,
+                    &hdr_map,
+                    body,
+                    &url,
+                );
+                let req_socket =
+                    qjs::JS_GetPropertyStr(ctx, this, CString::new("socket").unwrap().as_ptr());
+                if qjs::JS_IsObject(req_socket) {
+                    qjs::JS_SetPropertyStr(
+                        ctx,
+                        req_socket,
+                        CString::new("bytesRead").unwrap().as_ptr(),
+                        qjs_compat::new_int(ctx, response_body_len),
+                    );
+                }
+                js_free_value(ctx, req_socket);
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    res_obj,
+                    CString::new("req").unwrap().as_ptr(),
+                    js_dup_value(this),
+                );
+                let mut arg = [res_obj];
+                let out = qjs::JS_Call(ctx, cb_v, js_undefined(), 1, arg.as_mut_ptr());
+                js_free_value(ctx, out);
+                let emit_fn =
+                    qjs::JS_GetPropertyStr(ctx, res_obj, CString::new("emit").unwrap().as_ptr());
+                if qjs::JS_IsFunction(ctx, emit_fn) != 0 {
+                    let body_v = qjs::JS_GetPropertyStr(
+                        ctx,
+                        res_obj,
+                        CString::new("body").unwrap().as_ptr(),
+                    );
+                    let ev_data = qjs_compat::new_string_from_str(ctx, "data");
+                    let mut args_data = [ev_data, body_v];
+                    let r1 = qjs::JS_Call(ctx, emit_fn, res_obj, 2, args_data.as_mut_ptr());
+                    js_free_value(ctx, r1);
+                    let ev_end = qjs_compat::new_string_from_str(ctx, "end");
+                    let mut args_end = [ev_end];
+                    let r2 = qjs::JS_Call(ctx, emit_fn, res_obj, 1, args_end.as_mut_ptr());
+                    js_free_value(ctx, r2);
+                }
+                js_free_value(ctx, emit_fn);
+            }
+            Ok(Err(e)) => {
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    this,
+                    CString::new("errored").unwrap().as_ptr(),
+                    qjs_compat::new_string_from_str(ctx, &e),
+                );
+            }
+            Err(_) => {
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    this,
+                    CString::new("errored").unwrap().as_ptr(),
+                    qjs_compat::new_string_from_str(ctx, "http.request: panic in request path"),
+                );
+            }
+        }
+    }
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("writableEnded").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("writableFinished").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("finished").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("closed").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("headersSent").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        this,
+        CString::new("_headerSent").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    let socket = qjs::JS_GetPropertyStr(ctx, this, CString::new("socket").unwrap().as_ptr());
+    if qjs::JS_IsObject(socket) {
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("destroyed").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, true),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("readyState").unwrap().as_ptr(),
+            qjs_compat::new_string_from_str(ctx, "closed"),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("closed").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, true),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("readable").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, false),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("writable").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, false),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("connecting").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, false),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("pending").unwrap().as_ptr(),
+            qjs::JS_NewBool(ctx, false),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("bufferSize").unwrap().as_ptr(),
+            qjs_compat::new_int(ctx, 0),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            socket,
+            CString::new("writableLength").unwrap().as_ptr(),
+            qjs_compat::new_int(ctx, 0),
+        );
+    }
+    js_free_value(ctx, socket);
+    js_free_value(ctx, cb_v);
+    this
+}
+
+unsafe extern "C" fn js_http_client_request(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("http.request(url|options[, options][, callback]) requires arguments")
+                .unwrap_or_default()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let mut cb = js_undefined();
+    let mut method = "GET".to_string();
+    let url = if qjs::JS_IsObject(args[0]) {
+        let built = build_http_request_url_from_options(ctx, args[0]);
+        if let Some(m) = js_obj_get_opt_string(ctx, args[0], "method") {
+            method = m.to_uppercase();
+        }
+        if argc >= 2 && qjs::JS_IsFunction(ctx, args[1]) != 0 {
+            cb = args[1];
+        }
+        built
+    } else {
+        let built = js_string_to_owned(ctx, args[0]);
+        if argc >= 2 && qjs::JS_IsObject(args[1]) {
+            if let Some(m) = js_obj_get_opt_string(ctx, args[1], "method") {
+                method = m.to_uppercase();
+            }
+            if argc >= 3 && qjs::JS_IsFunction(ctx, args[2]) != 0 {
+                cb = args[2];
+            }
+        } else if argc >= 2 && qjs::JS_IsFunction(ctx, args[1]) != 0 {
+            cb = args[1];
+        }
+        built
+    };
+    let req_path = if qjs::JS_IsObject(args[0]) {
+        js_obj_get_opt_string(ctx, args[0], "path")
+            .unwrap_or_else(|| http_request_extract_path(&url))
+    } else {
+        http_request_extract_path(&url)
+    };
+    let req_protocol = if qjs::JS_IsObject(args[0]) {
+        js_obj_get_opt_string(ctx, args[0], "protocol")
+            .map(|p| if p.ends_with(':') { p } else { format!("{p}:") })
+            .unwrap_or_else(|| http_request_extract_protocol(&url))
+    } else {
+        http_request_extract_protocol(&url)
+    };
+    let req_hostname = if qjs::JS_IsObject(args[0]) {
+        js_obj_get_opt_string(ctx, args[0], "hostname")
+            .or_else(|| js_obj_get_opt_string(ctx, args[0], "host"))
+            .unwrap_or_else(|| http_request_extract_hostname(&url))
+    } else {
+        http_request_extract_hostname(&url)
+    };
+    let req_port = if qjs::JS_IsObject(args[0]) {
+        js_obj_get_opt_string(ctx, args[0], "port")
+            .unwrap_or_else(|| http_request_extract_port(&url))
+    } else {
+        http_request_extract_port(&url)
+    };
+    let req_host = if req_port.is_empty() {
+        req_hostname.clone()
+    } else {
+        format!("{}:{}", req_hostname, req_port)
+    };
+    let req_obj = qjs::JS_NewObject(ctx);
+    let _ = install_obj_fn(ctx, req_obj, "write", Some(js_http_client_req_write), 2);
+    let _ = install_obj_fn(ctx, req_obj, "end", Some(js_http_client_req_end), 2);
+    let _ = install_obj_fn(ctx, req_obj, "abort", Some(js_http_client_req_abort), 0);
+    let _ = install_obj_fn(ctx, req_obj, "destroy", Some(js_http_client_req_abort), 0);
+    let _ = install_obj_fn(ctx, req_obj, "on", Some(js_http_client_req_on), 2);
+    let _ = install_obj_fn(ctx, req_obj, "once", Some(js_http_client_req_on), 2);
+    let _ = install_obj_fn(ctx, req_obj, "addListener", Some(js_http_client_req_on), 2);
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "prependListener",
+        Some(js_http_client_req_on),
+        2,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "prependOnceListener",
+        Some(js_http_client_req_on),
+        2,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "setMaxListeners",
+        Some(js_http_client_req_set_max_listeners),
+        1,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "getMaxListeners",
+        Some(js_http_client_req_get_max_listeners),
+        0,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "removeListener",
+        Some(js_http_client_req_remove_listener),
+        2,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "off",
+        Some(js_http_client_req_remove_listener),
+        2,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "removeAllListeners",
+        Some(js_http_client_req_remove_all_listeners),
+        1,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "listenerCount",
+        Some(js_http_client_req_listener_count),
+        1,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "eventNames",
+        Some(js_http_client_req_event_names),
+        0,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "listeners",
+        Some(js_http_client_req_listeners),
+        1,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "rawListeners",
+        Some(js_http_client_req_raw_listeners),
+        1,
+    );
+    let _ = install_obj_fn(ctx, req_obj, "emit", Some(js_http_client_req_emit), 2);
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "setTimeout",
+        Some(js_http_client_req_set_timeout),
+        2,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "setHeader",
+        Some(js_http_client_req_set_header),
+        2,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "appendHeader",
+        Some(js_http_client_req_append_header),
+        2,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "removeHeader",
+        Some(js_http_client_req_remove_header),
+        1,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "getHeader",
+        Some(js_http_client_req_get_header),
+        1,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "hasHeader",
+        Some(js_http_client_req_has_header),
+        1,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "getHeaders",
+        Some(js_http_client_req_get_headers),
+        0,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "getHeaderNames",
+        Some(js_http_client_req_get_header_names),
+        0,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "getRawHeaderNames",
+        Some(js_http_client_req_get_raw_header_names),
+        0,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "flushHeaders",
+        Some(js_http_client_req_flush_headers),
+        0,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "setNoDelay",
+        Some(js_http_client_req_set_no_delay),
+        1,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "setSocketKeepAlive",
+        Some(js_http_client_req_set_socket_keep_alive),
+        2,
+    );
+    let _ = install_obj_fn(ctx, req_obj, "cork", Some(js_http_client_req_cork), 0);
+    let _ = install_obj_fn(ctx, req_obj, "uncork", Some(js_http_client_req_uncork), 0);
+    let _ = install_obj_fn(
+        ctx,
+        req_obj,
+        "setDefaultEncoding",
+        Some(js_http_client_req_set_default_encoding),
+        1,
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("method").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &method),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("path").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &req_path),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("protocol").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &req_protocol),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("hostname").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &req_hostname),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("host").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &req_host),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("port").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &req_port),
+    );
+
+    let headers_obj = qjs::JS_NewObject(ctx);
+    if qjs::JS_IsObject(args[0]) {
+        let hsrc = qjs::JS_GetPropertyStr(ctx, args[0], CString::new("headers").unwrap().as_ptr());
+        if qjs::JS_IsObject(hsrc) {
+            if let Ok(keys) = assert_own_enum_string_keys(ctx, hsrc) {
+                for k in keys {
+                    let v = qjs::JS_GetPropertyStr(
+                        ctx,
+                        hsrc,
+                        CString::new(k.clone()).unwrap_or_default().as_ptr(),
+                    );
+                    if !qjs::JS_IsUndefined(v) && !qjs::JS_IsNull(v) {
+                        qjs::JS_SetPropertyStr(
+                            ctx,
+                            headers_obj,
+                            CString::new(k.to_ascii_lowercase())
+                                .unwrap_or_default()
+                                .as_ptr(),
+                            qjs_compat::new_string_from_str(ctx, &js_string_to_owned(ctx, v)),
+                        );
+                    }
+                    js_free_value(ctx, v);
+                }
+            }
+        }
+        js_free_value(ctx, hsrc);
+    } else if argc >= 2 && qjs::JS_IsObject(args[1]) {
+        let hsrc = qjs::JS_GetPropertyStr(ctx, args[1], CString::new("headers").unwrap().as_ptr());
+        if qjs::JS_IsObject(hsrc) {
+            if let Ok(keys) = assert_own_enum_string_keys(ctx, hsrc) {
+                for k in keys {
+                    let v = qjs::JS_GetPropertyStr(
+                        ctx,
+                        hsrc,
+                        CString::new(k.clone()).unwrap_or_default().as_ptr(),
+                    );
+                    if !qjs::JS_IsUndefined(v) && !qjs::JS_IsNull(v) {
+                        qjs::JS_SetPropertyStr(
+                            ctx,
+                            headers_obj,
+                            CString::new(k.to_ascii_lowercase())
+                                .unwrap_or_default()
+                                .as_ptr(),
+                            qjs_compat::new_string_from_str(ctx, &js_string_to_owned(ctx, v)),
+                        );
+                    }
+                    js_free_value(ctx, v);
+                }
+            }
+        }
+        js_free_value(ctx, hsrc);
+    }
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("__kawkabReqUrl").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &url),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("__kawkabReqMethod").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &method),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("__kawkabReqCb").unwrap().as_ptr(),
+        js_dup_value(cb),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("__kawkabReqListeners").unwrap().as_ptr(),
+        qjs::JS_NewObject(ctx),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("__kawkabReqMaxListeners").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 10),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("__kawkabReqAborted").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("aborted").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("destroyed").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("reusedSocket").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("writableEnded").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("writableFinished").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("finished").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("closed").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("writableDefaultEncoding").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "utf8"),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("__kawkabReqDefaultEncoding").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "utf8"),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("headersSent").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("_headerSent").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("_header").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, ""),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("maxHeadersCount").unwrap().as_ptr(),
+        js_null(),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("errored").unwrap().as_ptr(),
+        js_null(),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("writableCorked").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    let req_socket = qjs::JS_NewObject(ctx);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("encrypted").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, req_protocol == "https:"),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("authorized").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("authorizationError").unwrap().as_ptr(),
+        js_null(),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("alpnProtocol").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, ""),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("servername").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &req_hostname),
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_socket,
+        "setTimeout",
+        Some(js_http_client_req_socket_set_timeout),
+        2,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_socket,
+        "setKeepAlive",
+        Some(js_http_client_socket_set_keep_alive),
+        2,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_socket,
+        "setNoDelay",
+        Some(js_http_client_socket_set_no_delay),
+        1,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_socket,
+        "address",
+        Some(js_http_client_req_socket_address),
+        0,
+    );
+    let _ = install_obj_fn(ctx, req_socket, "ref", Some(js_http_client_socket_ref), 0);
+    let _ = install_obj_fn(
+        ctx,
+        req_socket,
+        "unref",
+        Some(js_http_client_socket_unref),
+        0,
+    );
+    let _ = install_obj_fn(
+        ctx,
+        req_socket,
+        "setEncoding",
+        Some(js_http_client_socket_set_encoding),
+        1,
+    );
+    let _ = install_obj_fn(ctx, req_socket, "end", Some(js_http_client_socket_end), 1);
+    let _ = install_obj_fn(
+        ctx,
+        req_socket,
+        "destroy",
+        Some(js_http_client_socket_destroy),
+        1,
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("noDelay").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("keepAlive").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("keepAliveInitialDelay").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("destroyed").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("connecting").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("pending").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("remoteAddress").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &req_hostname),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("remoteFamily").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "IPv4"),
+    );
+    let remote_port_num: i64 = if req_port.is_empty() {
+        if req_protocol == "https:" {
+            443
+        } else {
+            80
+        }
+    } else {
+        req_port.parse::<i64>().unwrap_or(0)
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("remotePort").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, remote_port_num),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("localAddress").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "127.0.0.1"),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("localFamily").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "IPv4"),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("localPort").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("bytesRead").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("bytesWritten").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("bufferSize").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("writableLength").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("timeout").unwrap().as_ptr(),
+        qjs_compat::new_int(ctx, 0),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("readyState").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, "open"),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("closed").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("readable").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_socket,
+        CString::new("writable").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("socket").unwrap().as_ptr(),
+        js_dup_value(req_socket),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("connection").unwrap().as_ptr(),
+        req_socket,
+    );
+    let agent_v = if qjs::JS_IsObject(args[0]) {
+        let av = qjs::JS_GetPropertyStr(ctx, args[0], CString::new("agent").unwrap().as_ptr());
+        if qjs::JS_IsUndefined(av) || qjs::JS_IsNull(av) {
+            js_free_value(ctx, av);
+            qjs::JS_NewBool(ctx, false)
+        } else {
+            av
+        }
+    } else if argc >= 2 && qjs::JS_IsObject(args[1]) {
+        let av = qjs::JS_GetPropertyStr(ctx, args[1], CString::new("agent").unwrap().as_ptr());
+        if qjs::JS_IsUndefined(av) || qjs::JS_IsNull(av) {
+            js_free_value(ctx, av);
+            qjs::JS_NewBool(ctx, false)
+        } else {
+            av
+        }
+    } else {
+        qjs::JS_NewBool(ctx, false)
+    };
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("agent").unwrap().as_ptr(),
+        agent_v,
+    );
+    if qjs::JS_IsObject(args[0]) {
+        if let Some(timeout_raw) = js_obj_get_opt_string(ctx, args[0], "timeout") {
+            if let Ok(timeout_ms) = timeout_raw.parse::<i64>() {
+                qjs::JS_SetPropertyStr(
+                    ctx,
+                    req_obj,
+                    CString::new("__kawkabReqTimeoutMs").unwrap().as_ptr(),
+                    qjs_compat::new_int(ctx, timeout_ms.max(0)),
+                );
+            }
+        }
+    }
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("__kawkabReqChunks").unwrap().as_ptr(),
+        qjs::JS_NewArray(ctx),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        req_obj,
+        CString::new("__kawkabReqHeaders").unwrap().as_ptr(),
+        headers_obj,
+    );
+    req_obj
 }
 
 unsafe extern "C" fn js_kawkab_fast_sum(
@@ -9841,6 +13025,103 @@ unsafe extern "C" fn js_require(
     if request == "module" {
         let obj = qjs::JS_NewObject(ctx);
         let _ = install_obj_fn(ctx, obj, "createRequire", Some(js_module_create_require), 1);
+        let _ = install_obj_fn(ctx, obj, "isBuiltin", Some(js_module_is_builtin), 1);
+        let _ = install_obj_fn(ctx, obj, "_load", Some(js_module_load), 3);
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "_resolveFilename",
+            Some(js_module_resolve_filename),
+            2,
+        );
+        let _ = install_obj_fn(
+            ctx,
+            obj,
+            "_nodeModulePaths",
+            Some(js_module_node_module_paths),
+            1,
+        );
+        let _ = install_obj_fn(ctx, obj, "syncBuiltinESMExports", Some(js_noop), 0);
+        let _ = install_obj_fn(ctx, obj, "findSourceMap", Some(js_noop), 1);
+        let arr = qjs::JS_NewArray(ctx);
+        for (i, name) in MODULE_BUILTIN_NAMES.iter().enumerate() {
+            qjs::JS_SetPropertyUint32(
+                ctx,
+                arr,
+                i as u32,
+                qjs_compat::new_string_from_str(ctx, name),
+            );
+        }
+        qjs::JS_SetPropertyStr(
+            ctx,
+            obj,
+            CString::new("builtinModules").unwrap().as_ptr(),
+            arr,
+        );
+        let module_cache = get_or_create_require_cache(ctx);
+        qjs::JS_SetPropertyStr(
+            ctx,
+            obj,
+            CString::new("_cache").unwrap().as_ptr(),
+            module_cache,
+        );
+        let module_ext = get_or_create_require_extensions(ctx);
+        qjs::JS_SetPropertyStr(
+            ctx,
+            obj,
+            CString::new("_extensions").unwrap().as_ptr(),
+            module_ext,
+        );
+        let module_ctor = qjs::JS_NewObject(ctx);
+        let _ = install_obj_fn(
+            ctx,
+            module_ctor,
+            "createRequire",
+            Some(js_module_create_require),
+            1,
+        );
+        let _ = install_obj_fn(ctx, module_ctor, "isBuiltin", Some(js_module_is_builtin), 1);
+        let _ = install_obj_fn(ctx, module_ctor, "_load", Some(js_module_load), 3);
+        let _ = install_obj_fn(
+            ctx,
+            module_ctor,
+            "_resolveFilename",
+            Some(js_module_resolve_filename),
+            2,
+        );
+        let _ = install_obj_fn(
+            ctx,
+            module_ctor,
+            "_nodeModulePaths",
+            Some(js_module_node_module_paths),
+            1,
+        );
+        let _ = install_obj_fn(ctx, module_ctor, "syncBuiltinESMExports", Some(js_noop), 0);
+        let _ = install_obj_fn(ctx, module_ctor, "findSourceMap", Some(js_noop), 1);
+        qjs::JS_SetPropertyStr(
+            ctx,
+            module_ctor,
+            CString::new("builtinModules").unwrap().as_ptr(),
+            js_dup_value(arr),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            module_ctor,
+            CString::new("_cache").unwrap().as_ptr(),
+            qjs::JS_GetPropertyStr(ctx, obj, CString::new("_cache").unwrap().as_ptr()),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            module_ctor,
+            CString::new("_extensions").unwrap().as_ptr(),
+            qjs::JS_GetPropertyStr(ctx, obj, CString::new("_extensions").unwrap().as_ptr()),
+        );
+        qjs::JS_SetPropertyStr(
+            ctx,
+            obj,
+            CString::new("Module").unwrap().as_ptr(),
+            module_ctor,
+        );
         return obj;
     }
     if request == "tty" || request == "node:tty" {
@@ -10069,13 +13350,53 @@ unsafe extern "C" fn js_require(
     }
 
     let global = qjs::JS_GetGlobalObject(ctx);
+    let require_cache = get_or_create_require_cache(ctx);
+    let resolved_key = CString::new(resolved.clone()).unwrap_or_default();
+    let cached_module = qjs::JS_GetPropertyStr(ctx, require_cache, resolved_key.as_ptr());
+    if qjs::JS_IsObject(cached_module) {
+        let cached_exports = qjs::JS_GetPropertyStr(
+            ctx,
+            cached_module,
+            CString::new("exports").unwrap().as_ptr(),
+        );
+        crate::ffi::js_free_value(ctx, cached_module);
+        crate::ffi::js_free_value(ctx, require_cache);
+        crate::ffi::js_free_value(ctx, func_val);
+        crate::ffi::js_free_value(ctx, global);
+        return cached_exports;
+    }
+    crate::ffi::js_free_value(ctx, cached_module);
     let module_obj = qjs::JS_NewObject(ctx);
     let exports_obj = qjs::JS_NewObject(ctx);
     qjs::JS_SetPropertyStr(
         ctx,
         module_obj,
+        CString::new("id").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &resolved),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        module_obj,
+        CString::new("filename").unwrap().as_ptr(),
+        qjs_compat::new_string_from_str(ctx, &resolved),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        module_obj,
+        CString::new("loaded").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, false),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        module_obj,
         CString::new("exports").unwrap().as_ptr(),
         crate::ffi::js_dup_value(exports_obj),
+    );
+    qjs::JS_SetPropertyStr(
+        ctx,
+        require_cache,
+        resolved_key.as_ptr(),
+        crate::ffi::js_dup_value(module_obj),
     );
 
     let require_fn = qjs::JS_GetPropertyStr(ctx, global, CString::new("require").unwrap().as_ptr());
@@ -10125,6 +13446,7 @@ unsafe extern "C" fn js_require(
     crate::ffi::js_free_value(ctx, require_fn);
     crate::ffi::js_free_value(ctx, filename_val);
     crate::ffi::js_free_value(ctx, dirname_val);
+    crate::ffi::js_free_value(ctx, require_cache);
     crate::ffi::js_free_value(ctx, global);
 
     if is_exception(ret) {
@@ -10137,10 +13459,21 @@ unsafe extern "C" fn js_require(
                 resolved, msg
             );
         }
+        let global2 = qjs::JS_GetGlobalObject(ctx);
+        let cache2 = get_or_create_require_cache(ctx);
+        qjs::JS_SetPropertyStr(ctx, cache2, resolved_key.as_ptr(), js_undefined());
+        crate::ffi::js_free_value(ctx, cache2);
+        crate::ffi::js_free_value(ctx, global2);
         crate::ffi::js_free_value(ctx, module_obj);
         return ret;
     }
     crate::ffi::js_free_value(ctx, ret);
+    qjs::JS_SetPropertyStr(
+        ctx,
+        module_obj,
+        CString::new("loaded").unwrap().as_ptr(),
+        qjs::JS_NewBool(ctx, true),
+    );
 
     let out = qjs::JS_GetPropertyStr(ctx, module_obj, CString::new("exports").unwrap().as_ptr());
     if require_trace {
@@ -10170,6 +13503,38 @@ fn strip_file_url(s: &str) -> String {
     }
 }
 
+unsafe fn js_create_require_filename_arg_to_path(
+    ctx: *mut qjs::JSContext,
+    value: qjs::JSValue,
+) -> String {
+    if qjs::JS_IsObject(value) {
+        let href_v = qjs::JS_GetPropertyStr(ctx, value, CString::new("href").unwrap().as_ptr());
+        if !qjs::JS_IsUndefined(href_v) && !qjs::JS_IsNull(href_v) {
+            let href_s = js_string_to_owned(ctx, href_v);
+            js_free_value(ctx, href_v);
+            return strip_file_url(&href_s);
+        }
+        js_free_value(ctx, href_v);
+
+        let proto_v =
+            qjs::JS_GetPropertyStr(ctx, value, CString::new("protocol").unwrap().as_ptr());
+        let path_v = qjs::JS_GetPropertyStr(ctx, value, CString::new("pathname").unwrap().as_ptr());
+        if !qjs::JS_IsUndefined(proto_v) && !qjs::JS_IsNull(proto_v) {
+            let protocol = js_string_to_owned(ctx, proto_v);
+            if protocol == "file:" && !qjs::JS_IsUndefined(path_v) && !qjs::JS_IsNull(path_v) {
+                let pathname = js_string_to_owned(ctx, path_v);
+                js_free_value(ctx, proto_v);
+                js_free_value(ctx, path_v);
+                return pathname;
+            }
+        }
+        js_free_value(ctx, proto_v);
+        js_free_value(ctx, path_v);
+    }
+    let s = js_string_to_owned(ctx, value);
+    strip_file_url(&s)
+}
+
 unsafe extern "C" fn js_module_create_require(
     ctx: *mut qjs::JSContext,
     _this: qjs::JSValue,
@@ -10185,21 +13550,191 @@ unsafe extern "C" fn js_module_create_require(
         );
     }
     let args = std::slice::from_raw_parts(argv, argc as usize);
-    let url_or_path = js_string_to_owned(ctx, args[0]);
-    let filename = strip_file_url(&url_or_path);
+    let filename = js_create_require_filename_arg_to_path(ctx, args[0]);
     let parent = Path::new(&filename)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_string());
     let parent_val = qjs_compat::new_string_from_str(ctx, &parent);
-    qjs::JS_NewCFunctionData(
+    let bound = qjs::JS_NewCFunctionData(
         ctx,
         Some(js_require_bound_to_dir),
         1,
         0,
         1,
         &mut [parent_val] as *mut qjs::JSValue,
-    )
+    );
+    let _ = install_require_resolve_helper(ctx, bound, &parent);
+    bound
+}
+
+unsafe extern "C" fn js_module_is_builtin(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_NewBool(ctx, false);
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let name = js_string_to_owned(ctx, args[0]);
+    qjs::JS_NewBool(ctx, module_is_builtin_name(&name))
+}
+
+unsafe extern "C" fn js_module_load(
+    ctx: *mut qjs::JSContext,
+    this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("Module._load(request[, parent[, isMain]]) requires request")
+                .unwrap_or_default()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let base_dir = if argc >= 2 && qjs::JS_IsObject(args[1]) {
+        let parent_filename =
+            qjs::JS_GetPropertyStr(ctx, args[1], CString::new("filename").unwrap().as_ptr());
+        if !qjs::JS_IsUndefined(parent_filename) && !qjs::JS_IsNull(parent_filename) {
+            let p = js_string_to_owned(ctx, parent_filename);
+            js_free_value(ctx, parent_filename);
+            Path::new(&p)
+                .parent()
+                .map(|pp| pp.to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string())
+        } else {
+            js_free_value(ctx, parent_filename);
+            REQUIRE_BASE_DIR.with(|v| v.borrow().clone())
+        }
+    } else {
+        REQUIRE_BASE_DIR.with(|v| v.borrow().clone())
+    };
+    let previous = REQUIRE_BASE_DIR.with(|v| {
+        let p = v.borrow().clone();
+        *v.borrow_mut() = base_dir;
+        p
+    });
+    let _guard = RequireBaseDirGuard { previous };
+    js_require(ctx, this, 1, argv)
+}
+
+unsafe extern "C" fn js_require_resolve_bound_to_dir(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+    _magic: c_int,
+    data: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("require.resolve(request) requires request")
+                .unwrap_or_default()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let request = js_string_to_owned(ctx, args[0]);
+    if module_is_builtin_name(&request) {
+        return qjs_compat::new_string_from_str(ctx, request.trim());
+    }
+    let base_dir = js_string_to_owned(ctx, *data);
+    refresh_package_exports_node_env(ctx);
+    let resolved = resolve_module_path(&base_dir, &request);
+    qjs_compat::new_string_from_str(ctx, &resolved)
+}
+
+unsafe extern "C" fn js_require_resolve_paths_bound_to_dir(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+    _magic: c_int,
+    data: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("require.resolve.paths(request) requires request")
+                .unwrap_or_default()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let request = js_string_to_owned(ctx, args[0]);
+    if module_is_builtin_name(&request) {
+        return js_null();
+    }
+    let base_dir = js_string_to_owned(ctx, *data);
+    let paths = module_lookup_paths(&base_dir);
+    js_array_from_strings(ctx, &paths)
+}
+
+unsafe extern "C" fn js_module_resolve_filename(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("Module._resolveFilename(request[, parent]) requires request")
+                .unwrap_or_default()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let request = js_string_to_owned(ctx, args[0]);
+    if module_is_builtin_name(&request) {
+        return qjs_compat::new_string_from_str(ctx, request.trim());
+    }
+    let base_dir = if argc >= 2 && qjs::JS_IsObject(args[1]) {
+        let parent_filename =
+            qjs::JS_GetPropertyStr(ctx, args[1], CString::new("filename").unwrap().as_ptr());
+        if !qjs::JS_IsUndefined(parent_filename) && !qjs::JS_IsNull(parent_filename) {
+            let p = js_string_to_owned(ctx, parent_filename);
+            js_free_value(ctx, parent_filename);
+            Path::new(&p)
+                .parent()
+                .map(|pp| pp.to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string())
+        } else {
+            js_free_value(ctx, parent_filename);
+            REQUIRE_BASE_DIR.with(|v| v.borrow().clone())
+        }
+    } else {
+        REQUIRE_BASE_DIR.with(|v| v.borrow().clone())
+    };
+    refresh_package_exports_node_env(ctx);
+    let resolved = resolve_module_path(&base_dir, &request);
+    qjs_compat::new_string_from_str(ctx, &resolved)
+}
+
+unsafe extern "C" fn js_module_node_module_paths(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValue,
+    argc: c_int,
+    argv: *mut qjs::JSValue,
+) -> qjs::JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            CString::new("Module._nodeModulePaths(from) requires from")
+                .unwrap_or_default()
+                .as_ptr(),
+        );
+    }
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let from = js_string_to_owned(ctx, args[0]);
+    let paths = module_lookup_paths(&from);
+    js_array_from_strings(ctx, &paths)
 }
 
 unsafe extern "C" fn js_require_bound_to_dir(
@@ -10947,7 +14482,7 @@ unsafe extern "C" fn js_util_types_is_array_buffer(
     let args = std::slice::from_raw_parts(argv, argc as usize);
     let mut sz = 0usize;
     let p = qjs::JS_GetArrayBuffer(ctx, &mut sz, args[0]);
-    qjs::JS_NewBool(ctx, if p.is_null() { false } else { true })
+    qjs::JS_NewBool(ctx, !p.is_null())
 }
 
 unsafe extern "C" fn js_util_types_is_string(
@@ -12212,8 +15747,8 @@ unsafe fn parse_http_listen_args(
         return (3000, "127.0.0.1".to_string(), None);
     }
     let mut callback_idx: Option<usize> = None;
-    for i in (0..args.len()).rev() {
-        if qjs::JS_IsFunction(ctx, args[i]) != 0 {
+    for (i, v) in args.iter().enumerate().rev() {
+        if qjs::JS_IsFunction(ctx, *v) != 0 {
             callback_idx = Some(i);
             break;
         }
@@ -12222,11 +15757,11 @@ unsafe fn parse_http_listen_args(
     let mut port: u32 = 3000;
     let mut saw_port = false;
     let mut host: Option<String> = None;
-    for i in 0..args.len() {
+    for (i, vref) in args.iter().enumerate() {
         if callback_idx == Some(i) {
             continue;
         }
-        let v = args[i];
+        let v = *vref;
         if qjs::JS_IsFunction(ctx, v) != 0 {
             continue;
         }
@@ -12234,8 +15769,7 @@ unsafe fn parse_http_listen_args(
             let mut d: f64 = 0.0;
             if qjs::JS_ToFloat64(ctx, &mut d as *mut f64, v) == 0
                 && d.is_finite()
-                && d >= 0.0
-                && d <= 65535.0
+                && (0.0..=65535.0).contains(&d)
             {
                 port = d as u32;
                 saw_port = true;
@@ -13007,8 +16541,8 @@ unsafe extern "C" fn js_events_emit(
         if qjs::JS_IsFunction(ctx, cb) != 0 {
             let mut owned_args: Vec<qjs::JSValue> = Vec::new();
             if argc > 1 {
-                for j in 1..(argc as usize) {
-                    owned_args.push(js_dup_value(args[j]));
+                for arg in args.iter().take(argc as usize).skip(1) {
+                    owned_args.push(js_dup_value(*arg));
                 }
             }
             let ret = qjs::JS_Call(

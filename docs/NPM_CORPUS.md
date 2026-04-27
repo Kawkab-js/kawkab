@@ -2,6 +2,17 @@
 
 Use this list to **measure** compatibility improvements (Kawkab vs Node). It is **not** a full registry sweep. **KPI targets** and pass semantics: `[COMPAT_KPI.md](COMPAT_KPI.md)`. Frozen Top 100 package basket: [`data/top100-packages.txt`](data/top100-packages.txt) (repo path `docs/data/top100-packages.txt`).
 
+Quick navigation:
+- [How to run](#how-to-run)
+- [Pass criteria (summary)](#pass-criteria-summary)
+- [Express ecosystem (KPI: 100% of rows below)](#express-ecosystem-kpi-100-of-rows-below)
+- [NestJS (KPI: 100% of rows below)](#nestjs-kpi-100-of-rows-below)
+- [Prisma (KPI: 100% of rows below)](#prisma-kpi-100-of-rows-below)
+- [Next.js custom server (KPI: 90% of rows below)](#nextjs-custom-server-kpi-90-of-rows-below)
+- [Top 100 basket — automated smoke (`revision: 2`, KPI: 100% QuickJS target)](#top-100-basket--automated-smoke-revision-2-kpi-100-quickjs-target)
+- [General packages / scenarios (seed list)](#general-packages--scenarios-seed-list)
+- [Adding entries](#adding-entries)
+
 ## How to run
 
 - **Rust API / resolution:** `RUST_TEST_THREADS=1 cargo test -p kawkab-core` (includes `module_loader` tests; serial threads avoid rare `worker_threads` harness `SIGABRT` when other workspace test binaries overlap locally).

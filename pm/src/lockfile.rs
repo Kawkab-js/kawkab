@@ -52,3 +52,9 @@ impl KawkabLock {
         Ok(())
     }
 }
+
+impl Default for KawkabLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}

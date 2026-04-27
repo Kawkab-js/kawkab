@@ -2,6 +2,14 @@
 
 This document states **where Kawkab aims to win**, what is **explicitly out of scope** as a near-term promise, and **engineering themes** that matter more than chasing a single headline metric. For the contractual feature list and build targets, see `[FEATURE_BASELINE.md](FEATURE_BASELINE.md)`. For module-by-module Node alignment, see `[NODE_COMPATIBILITY.md](NODE_COMPATIBILITY.md)`.
 
+Documentation map:
+- Product direction and trade-offs: `PRODUCT_VISION.md` (this file).
+- Runtime/platform contract and shipped behavior: `FEATURE_BASELINE.md`.
+- Module/global compatibility matrix: `NODE_COMPATIBILITY.md`.
+- Status semantics and promotion policy (`🟢/🟡/🔴`): `COMPAT_DEFINITION_OF_DONE.md`.
+- Release gates and verification flow: `RELEASE_CHECKLIST.md`.
+- Ecosystem KPI targets: `COMPAT_KPI.md`.
+
 ## Positioning
 
 Kawkab is a **Rust-centered** JavaScript runtime and toolchain that optimizes for:

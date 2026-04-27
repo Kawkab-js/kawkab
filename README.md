@@ -10,6 +10,12 @@ Current state of this repository:
 - Feature baseline source-of-truth: `docs/FEATURE_BASELINE.md`.
 - Product positioning (sweet spots, non-goals, engineering themes): `docs/PRODUCT_VISION.md`.
 
+Compatibility documentation map:
+- Compatibility matrix and module/global status: `docs/NODE_COMPATIBILITY.md`.
+- Baseline behavior contract and shipped scope: `docs/FEATURE_BASELINE.md`.
+- Meaning of `🟢/🟡/🔴` and review policy: `docs/COMPAT_DEFINITION_OF_DONE.md`.
+- Release gates and smoke/perf checklist: `docs/RELEASE_CHECKLIST.md`.
+
 ## Project Structure
 
 - `core`: Rust package **`kawkab-core`** — core runtime logic (QuickJS integration, Node-style bootstrap, loaders, transpiler).
@@ -203,7 +209,7 @@ Detailed module/global status matrix:
   - `Buffer`: global constructor from `core/src/node/buffer.rs` (`Uint8Array` subclass + native helpers); `require('buffer')` re-exports the same global
   - `child_process`: `execSync`, `spawnSync` (policy-gated; disabled by default)
   - Compatibility-focused baseline behavior added for: `stream`, `url`, `punycode`, `querystring`, `string_decoder`, `crypto` (hash/hmac + `randomBytes`; see NODE_COMPATIBILITY), `dgram`, `diagnostics_channel`, `dns` (full callback + `dns/promises` surface), `tls`, `vm`, `worker_threads`, `timers` (and `timers/promises` subset), `perf_hooks`, `node:test`
-  - Web-style globals at bootstrap (when missing): `atob`, `btoa`, minimal `performance` (`now`, `timeOrigin`), JSON-subset `structuredClone`; see `install_web_compat_globals` in `core/src/node/mod.rs`
+  - Web-style globals at bootstrap include: `atob`, `btoa`, `structuredClone` (Map/Set/Date/typed-array baseline), `performance` baseline, and expanded HTTP/web shims (`fetch`, `Headers`, `Request`, `Response`, `TextEncoder`, `TextDecoder`, stream/messaging constructors); see `docs/NODE_COMPATIBILITY.md`
   - `http`: TCP-backed `createServer` / `listen` / `close` with parsed `req.method`, `req.url`, `req.headers`, `req.body` (string), `req.httpVersion`, plus `res.statusCode`, `res.setHeader`, `res.writeHead`, `res.end` (keeps listening until `server.close()`)
   - `https`: same `createServer` shim as `http` (no TLS; packages that only `require('https')` can load)
   - `net`: same `createServer` entrypoint as `http` for compatibility-style usage
@@ -212,7 +218,7 @@ Detailed module/global status matrix:
 - Timer behavior is synchronous/blocking for now (compatibility API first, performance model later).
 - Microtask/timer scheduling is currently synchronous (not a full Node event loop yet).
 - `Buffer` is a compatibility layer (typed-array-backed), not full Node v23 `buffer` parity.
-- **`console` (CLI):** only `console.log` is installed on the default `kawkab` path; `error`/`warn`/etc. are not. There is no `require('console')`. See `docs/NODE_COMPATIBILITY.md`.
+- **`console` (CLI):** baseline `globalThis.console` methods are available on the `kawkab` CLI path, and `require('console')` / `require('node:console')` expose the same object (not full Node `Console` constructor/options parity). See `docs/NODE_COMPATIBILITY.md`.
 - `events` / `util` compatibility covers common baseline behavior but is not yet full Node parity.
 - Compatibility modules are now split between:
   - behavior-ready baseline paths (`stream`, `url`, `punycode`, `querystring`, `string_decoder`, `crypto`, `dgram`, `diagnostics_channel`, `dns`, `worker_threads`, `vm`, `timers`/`timers/promises`, `perf_hooks`, `node:test`, plus global `atob`/`btoa`/`performance`/`structuredClone`)
