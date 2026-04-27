@@ -3,10 +3,11 @@
 This document is the **product-facing compatibility contract**: we optimize for **real stacks and registry usage**, not 100% Node.js built-in API parity. Module-level status remains in `[NODE_COMPATIBILITY.md](NODE_COMPATIBILITY.md)`; **prioritization** when they conflict should follow this file and `[NPM_CORPUS.md](NPM_CORPUS.md)`.
 
 Quick navigation:
+- [Docs index](INDEX.md)
 - [Target table](#target-table)
 - [Pass criteria](#pass-criteria)
 - [Frozen Top 100 list](#frozen-top-100-list)
-- [Tier scope (what 100% / 90% includes)](#tier-scope-what-100--90-includes)
+- [Tier scope (what 100% and 90% include)](#tier-scope-what-100-and-90-include)
 - [Relationship to the compatibility matrix](#relationship-to-the-compatibility-matrix)
 - [Automation](#automation)
 - [Related docs](#related-docs)
@@ -39,7 +40,7 @@ A scenario **passes** when, on a supported Linux environment (see `[FEATURE_BASE
 - **Purpose:** Auditable denominator for the **100%** QuickJS KPI. Update the file only with an intentional **revision** (bump the `generated_on` / `revision` header inside the file) and adjust corpus rows accordingly.
 - **Not** a claim that every line is “#1 by downloads this week”; it is a **versioned basket** for regression tracking. Replace or extend via PR with rationale.
 
-## Tier scope (what “100%” / “90%” includes)
+## Tier scope (what 100% and 90% include)
 
 ### Express ecosystem
 

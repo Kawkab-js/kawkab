@@ -3,13 +3,14 @@
 Use this list to **measure** compatibility improvements (Kawkab vs Node). It is **not** a full registry sweep. **KPI targets** and pass semantics: `[COMPAT_KPI.md](COMPAT_KPI.md)`. Frozen Top 100 package basket: [`data/top100-packages.txt`](data/top100-packages.txt) (repo path `docs/data/top100-packages.txt`).
 
 Quick navigation:
+- [Docs index](INDEX.md)
 - [How to run](#how-to-run)
 - [Pass criteria (summary)](#pass-criteria-summary)
 - [Express ecosystem (KPI: 100% of rows below)](#express-ecosystem-kpi-100-of-rows-below)
 - [NestJS (KPI: 100% of rows below)](#nestjs-kpi-100-of-rows-below)
 - [Prisma (KPI: 100% of rows below)](#prisma-kpi-100-of-rows-below)
 - [Next.js custom server (KPI: 90% of rows below)](#nextjs-custom-server-kpi-90-of-rows-below)
-- [Top 100 basket — automated smoke (`revision: 2`, KPI: 100% QuickJS target)](#top-100-basket--automated-smoke-revision-2-kpi-100-quickjs-target)
+- [Top 100 basket automated smoke (revision 2, KPI: 100% QuickJS target)](#top-100-basket-automated-smoke-revision-2-kpi-100-quickjs-target)
 - [General packages / scenarios (seed list)](#general-packages--scenarios-seed-list)
 - [Adding entries](#adding-entries)
 
@@ -77,7 +78,7 @@ For each row: **exit code 0** for both Node and Kawkab (unless “intentional di
 
 ---
 
-## Top 100 basket — automated smoke (`revision: 2`, KPI: 100% QuickJS target)
+## Top 100 basket automated smoke (revision 2, KPI: 100% QuickJS target)
 
 - **Frozen list:** [`data/top100-packages.txt`](data/top100-packages.txt) on disk as [`docs/data/top100-packages.txt`](../docs/data/top100-packages.txt). `revision: 2` swaps a few packages that required native binaries or default ESM-only installs for **CJS-friendly** alternatives while keeping 100 rows (see header comments in the list file).
 - **Fixture:** [`fixtures/kpi/top100-qjs/`](../fixtures/kpi/top100-qjs/) — `package.json` + `package-lock.json`, `smokes.cjs` (one deterministic `JSON.stringify` line per package), `check-one.cjs` runner, `.current-pkg` marker (gitignored) for the active package name.

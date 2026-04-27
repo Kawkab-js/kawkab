@@ -5,6 +5,7 @@ Kawkab expands **best-effort** alignment with Node.js **built-in names and rough
 Compatibility target in this document is aligned to **Node.js v23** surface area for *naming and expectations*, not byte-for-byte parity with Node or universal registry coverage. For product-level scope, see `[PRODUCT_VISION.md](PRODUCT_VISION.md)`. For **🟢/🟡 definitions**, see `[COMPAT_DEFINITION_OF_DONE.md](COMPAT_DEFINITION_OF_DONE.md)`. For **explicit non-goals / 🔴 stance**, see `[NODE_NON_GOALS.md](NODE_NON_GOALS.md)`.
 
 Quick navigation:
+- [Docs index](INDEX.md)
 - [What npm compatibility means here](#what-npm-compatibility-means-here)
 - [Implementation reference (source of truth)](#implementation-reference-source-of-truth)
 - [Status Legend](#status-legend)
@@ -15,6 +16,7 @@ Quick navigation:
 - [Notes](#notes)
 
 Related decision docs:
+- Central docs index: `INDEX.md`.
 - Behavioral/runtime baseline contract: `FEATURE_BASELINE.md`.
 - KPI targets and pass semantics: `COMPAT_KPI.md`.
 - Scenario corpus and smoke rows: `NPM_CORPUS.md`.

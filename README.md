@@ -11,10 +11,30 @@ Current state of this repository:
 - Product positioning (sweet spots, non-goals, engineering themes): `docs/PRODUCT_VISION.md`.
 
 Compatibility documentation map:
+- Central docs index: `docs/INDEX.md`.
+- Role-based quick start paths: `docs/INDEX.md#quick-start-paths-by-role`.
 - Compatibility matrix and module/global status: `docs/NODE_COMPATIBILITY.md`.
 - Baseline behavior contract and shipped scope: `docs/FEATURE_BASELINE.md`.
 - Meaning of `🟢/🟡/🔴` and review policy: `docs/COMPAT_DEFINITION_OF_DONE.md`.
 - Release gates and smoke/perf checklist: `docs/RELEASE_CHECKLIST.md`.
+
+Documentation update workflow (for contributors):
+1. Update `docs/NODE_COMPATIBILITY.md` for status/surface changes.
+2. Update `docs/FEATURE_BASELINE.md` for shipped behavioral impact.
+3. Update `docs/COMPAT_KPI.md` and/or `docs/NPM_CORPUS.md` if KPI rows or scenarios changed.
+4. Update `docs/RELEASE_CHECKLIST.md` if gates or required commands changed.
+5. Keep wording aligned to `Remaining vs Node v23`.
+6. Run `./scripts/docs_consistency_check.sh` before considering docs updates complete.
+
+CI note:
+- Documentation consistency is enforced in `.github/workflows/ci.yml` via `./scripts/docs_consistency_check.sh`.
+- Run the same command locally before pushing to catch issues early.
+
+Quick contributor checks:
+- `./scripts/docs_consistency_check.sh` (documentation consistency gate)
+- `./scripts/pre_release_sanity.sh` (docs consistency + fmt + clippy in one command)
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --features tokio-uring`
 
 ## Project Structure
 

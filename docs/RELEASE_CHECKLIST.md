@@ -3,6 +3,7 @@
 Use this before tagging a release or publishing binaries. Adjust version numbers and artifacts to your release process.
 
 Quick navigation:
+- [Docs index](INDEX.md)
 - [Preconditions](#preconditions)
 - [Build and tests](#build-and-tests)
 - [Smoke tests](#smoke-tests)
@@ -13,7 +14,14 @@ Quick navigation:
 ## Preconditions
 
 - All changes intended for the release are merged on the release branch.
+- Documentation index is up to date and reviewed: `docs/INDEX.md`.
+- Documentation validation checks from `docs/INDEX.md` were executed and reviewed (terminology consistency + navigation/link sanity + markdown diagnostics).
+- Documentation consistency script passes: `./scripts/docs_consistency_check.sh`.
+- CI note: the same documentation consistency script is enforced in `.github/workflows/ci.yml`; keep local release verification as the final pre-tag gate.
 - `docs/NODE_COMPATIBILITY.md` and `docs/FEATURE_BASELINE.md` match the code being released.
+
+Pre-release one-liner (local sanity):
+- `./scripts/pre_release_sanity.sh`
 
 ## Build and tests
 

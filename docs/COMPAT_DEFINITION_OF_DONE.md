@@ -5,6 +5,7 @@ This document defines what **🟢** and **🟡** mean in `[NODE_COMPATIBILITY.md
 **Prioritization:** The 🟢/🟡 matrix describes **module-level** readiness. When roadmap work conflicts (e.g. a rare built-in vs an Express/Nest/Prisma/Next smoke path), **product priority** follows ecosystem KPIs in `[COMPAT_KPI.md](COMPAT_KPI.md)` and scenarios in `[NPM_CORPUS.md](NPM_CORPUS.md)`.
 
 Quick navigation:
+- [Docs index](INDEX.md)
 - [Legend (contract)](#legend-contract)
 - [Scope boundaries](#scope-boundaries)
 - [Review cadence](#review-cadence)
@@ -32,6 +33,7 @@ When a phase in the roadmap lands, update in the **same change**:
 2. `[FEATURE_BASELINE.md](FEATURE_BASELINE.md)` — summary line if behavior is user-visible.
 3. Optional corpus entry in `[NPM_CORPUS.md](NPM_CORPUS.md)`.
 4. If the change affects a **KPI tier** (Top 100 basket, Express, NestJS, Prisma, Next custom server), update `[COMPAT_KPI.md](COMPAT_KPI.md)` and/or the relevant rows in `[NPM_CORPUS.md](NPM_CORPUS.md)`.
+5. Run the documentation maintenance and validation workflow in `[INDEX.md](INDEX.md)` before considering the doc update complete.
 
 ## Test stability policy (release gate)
 

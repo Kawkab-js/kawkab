@@ -10,6 +10,16 @@ Documentation map:
 - Release gates and verification flow: `RELEASE_CHECKLIST.md`.
 - Ecosystem KPI targets: `COMPAT_KPI.md`.
 
+Quick navigation:
+- [Docs index](INDEX.md)
+- [Positioning](#positioning)
+- [Engineering reality (QuickJS vs JIT engines)](#engineering-reality-quickjs-vs-jit-engines)
+- [Platform](#platform)
+- [Node.js compatibility stance](#nodejs-compatibility-stance)
+- [Security (today vs direction)](#security-today-vs-direction)
+- [Priority themes (not a dated roadmap)](#priority-themes-not-a-dated-roadmap)
+- [Related documentation](#related-documentation)
+
 ## Positioning
 
 Kawkab is a **Rust-centered** JavaScript runtime and toolchain that optimizes for:

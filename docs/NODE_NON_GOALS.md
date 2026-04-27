@@ -2,6 +2,19 @@
 
 Some Node.js subsystems are **not targeted for full 🟢 parity** in the near term, or are blocked by engine/policy choices. This table records the **default stance**; it can change if product scope changes.
 
+Quick navigation:
+- [Docs index](INDEX.md)
+- [Default stance table](#default-stance-table)
+- [Scope note](#scope-note)
+
+Related decision docs:
+- Compatibility matrix and status details: `NODE_COMPATIBILITY.md`.
+- Shipped behavioral baseline: `FEATURE_BASELINE.md`.
+- Promotion semantics (`🟢/🟡/🔴`): `COMPAT_DEFINITION_OF_DONE.md`.
+- KPI-first prioritization scope: `COMPAT_KPI.md`.
+- Release gating and verification flow: `RELEASE_CHECKLIST.md`.
+
+## Default stance table
 
 | Module / area          | Stance        | Reason                                                                                  |
 | ---------------------- | ------------- | --------------------------------------------------------------------------------------- |
@@ -18,5 +31,6 @@ Some Node.js subsystems are **not targeted for full 🟢 parity** in the near te
 | `http2`                | 🔴 / deferred | Large spec surface; HTTP/1.1 client/server baseline first.                              |
 | `tty`                  | 🔴 / partial  | Terminal integration depends on host; may stay stubbed.                                 |
 
+## Scope note
 
 Modules marked **🟡** in the matrix are **in scope** for incremental improvements unless explicitly moved here.
